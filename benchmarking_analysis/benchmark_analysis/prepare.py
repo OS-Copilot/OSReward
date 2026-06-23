@@ -41,14 +41,27 @@ def draw_mark(png_bytes, xy):
     return out.getvalue()
 
 
-def _emit(jr_dir, img_dir, subdir, json_name, rec, frames):
+def draw_mark_norm(png_bytes, xy_norm):
+    """Like draw_mark, but xy is in 0..1000 normalized coords (mobile)."""
+    img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+    if xy_norm is not None:
+        w, h = img.size
+        x, y = xy_norm[0] / 1000.0 * w, xy_norm[1] / 1000.0 * h
+        r = max(12, int(min(w, h) * 0.04))
+        ImageDraw.Draw(img).ellipse([x - r, y - r, x + r, y + r], outline="red", width=6)
+    out = io.BytesIO()
+    img.save(out, format="PNG")
+    return out.getvalue()
+
+
+def _emit(jr_dir, img_dir, subdir, json_name, rec, frames, mark_fn=draw_mark):
     """Mark+write the selected frames and the judge-ready JSON for one task."""
     task_img_dir = os.path.join(img_dir, subdir)
     os.makedirs(task_img_dir, exist_ok=True)
     rel_imgs = []
     for data, name, xy in frames:
         try:
-            data = draw_mark(data, xy)
+            data = mark_fn(data, xy)
         except Exception:
             pass
         dst = os.path.join(task_img_dir, os.path.basename(name))
@@ -183,6 +196,34 @@ def prepare_webarena_legacy(agent, set_dir, judge_subdir=None, limit=0):
         stats["ok"] += 1
         stats["gold"][r["golden_label"]] += 1
         stats["domains"]["web"] += 1
+    return stats
+
+
+def prepare_androidworld(agent, jsonl_path, last_n=5, root=None, limit=0):
+    """Prepare AndroidWorld (mobile) from a normalized merged-JSONL file.
+
+    ``jsonl_path`` points at the trajectories file (e.g. results/merged_*.jsonl);
+    screenshots resolve against ``root`` (default: two levels up). Click marks are
+    drawn from 0..1000 normalized coordinates.
+    """
+    _root, jr_dir, img_dir = _dirs("androidworld", agent)
+    stats = {"ok": 0, "skipped": 0, "gold": {"SUCCESS": 0, "FAIL": 0}, "domains": {"mobile": 0}}
+    for r in adapters.androidworld_records(jsonl_path, last_n, root):
+        if limit and stats["ok"] >= limit:
+            break
+        if r["golden_label"] not in ("SUCCESS", "FAIL"):
+            stats["skipped"] += 1
+            continue
+        safe = str(r["trace_id"]).replace("/", "__")
+        rec = {"trace_id": r["trace_id"], "agent": agent, "platform": "androidworld",
+               "domain": "mobile", "instruction": r["instruction"],
+               "golden_label": r["golden_label"], "n_steps": r["n_steps"],
+               "history": r["history"]}
+        _emit(jr_dir, img_dir, safe, f"{safe}.json", rec, r["read_frames"](),
+              mark_fn=draw_mark_norm)
+        stats["ok"] += 1
+        stats["gold"][r["golden_label"]] += 1
+        stats["domains"]["mobile"] += 1
     return stats
 
 

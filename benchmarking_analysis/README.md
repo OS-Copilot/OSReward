@@ -2,7 +2,7 @@
 
 Measures how well a reward model / LLM judge decides whether a GUI-agent
 trajectory **succeeded**, on **out-of-distribution** benchmarks
-(OSWorld · WindowsAgentArena · WebArena; macOS / Android use the same path).
+(OSWorld · WindowsAgentArena · WebArena · AndroidWorld; macOS uses the same path).
 
 Per trajectory, the judge sees the task instruction + the last *N* screenshots
 (click points circled) + the agent's thought/action history, and outputs
@@ -57,6 +57,7 @@ confusion counts (`fp` = lenient errors, `fn` = strict errors).
 |---|---|---|---|
 | osworld / windows | dir or zip of `<domain>/<task_id>/{result.txt, traj.jsonl, runtime.log, step_*.png}` | `dir` / `zip` | `result.txt` score ≥ `--success_threshold` (0.99) |
 | webarena | a rollout-set dir — merged-JSONL (`judged_*.jsonl`+`images/`) **or** legacy `judgements/` | n/a | recorded `task_success` / stored label |
+| androidworld | a normalized merged-JSONL **file** (e.g. `results/merged_*.jsonl`; screenshots resolve against the dir two levels up, or `--aw_root`) | n/a | recorded `task_success` |
 
 Two gotchas:
 - **OSWorld claude**: trajectories carry no instruction — prepare an agent that

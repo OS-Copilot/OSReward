@@ -15,6 +15,10 @@ Examples::
     # WebArena (merged-JSONL rollout set directory)
     python -m benchmark_analysis.cli.prepare --platform webarena --agent gpt5gemini3f \
         --path data/raw/webarena/gpt5gemini3f-sample
+
+    # AndroidWorld (normalized merged-JSONL file of trajectories)
+    python -m benchmark_analysis.cli.prepare --platform androidworld --agent merged300 \
+        --path data/raw/androidworld/<root>/results/merged_normalized_300.jsonl
 """
 import argparse
 import os
@@ -25,9 +29,11 @@ from .. import adapters, prepare
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--platform", required=True, help="osworld | windows | webarena | macos")
+    ap.add_argument("--platform", required=True,
+                    help="osworld | windows | webarena | androidworld | macos")
     ap.add_argument("--agent", required=True, help="rollout-agent label (output subdir)")
-    ap.add_argument("--path", required=True, help="zip / dir (desktop) or rollout-set dir (webarena)")
+    ap.add_argument("--path", required=True,
+                    help="zip/dir (desktop), rollout-set dir (webarena), or .jsonl (androidworld)")
     ap.add_argument("--kind", default="dir", choices=["dir", "zip"], help="desktop source kind")
     ap.add_argument("--last_n", type=int, default=5, help="screenshots kept (the last N)")
     ap.add_argument("--success_threshold", type=float, default=prepare.SUCCESS_THRESHOLD,
@@ -36,6 +42,8 @@ def main():
                     help="fold ossymphony code/search sub-agent outputs into history")
     ap.add_argument("--judge_subdir", default=None,
                     help="webarena legacy: judgements/<subdir> to read (default: auto)")
+    ap.add_argument("--aw_root", default=None,
+                    help="androidworld: base dir for screenshot_path (default: two levels up from --path)")
     ap.add_argument("--limit", type=int, default=0, help="prepare only the first N tasks (0 = all)")
     args = ap.parse_args()
 
@@ -51,6 +59,9 @@ def main():
                                                     limit=args.limit)
         else:
             raise SystemExit(f"webarena: no *.jsonl and no judgements/ under {path}")
+    elif args.platform == "androidworld":
+        stats = prepare.prepare_androidworld(args.agent, path, args.last_n,
+                                             root=args.aw_root, limit=args.limit)
     else:
         source = adapters.ZipSource(path) if args.kind == "zip" else adapters.DirSource(path)
         stats = prepare.prepare_desktop(args.platform, args.agent, source,

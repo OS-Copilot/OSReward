@@ -9,8 +9,9 @@ data/
 ├── raw/                                  # inputs to `prepare` (point --path here)
 │   ├── osworld/<agent>/<domain>/<task_id>/{result.txt, traj.jsonl, runtime.log, step_*.png}
 │   ├── windows/<agent>/<domain>/<task_id>/{result.txt, traj.jsonl, step_*.png}
-│   └── webarena/<rollout-set>/            # merged-JSONL (judged_*.jsonl + images/)
-│                                          #   or legacy judgements/ (auto-detected)
+│   ├── webarena/<rollout-set>/            # merged-JSONL (judged_*.jsonl + images/)
+│   │                                      #   or legacy judgements/ (auto-detected)
+│   └── androidworld/<root>/               # results/*.jsonl + <agent>/<task>/screenshot_*.png
 └── analysis/<platform>/                  # outputs (created by the pipeline)
     ├── judge_ready/<agent>/<domain>__<task_id>.json
     ├── images/<agent>/<task_id>/*.png

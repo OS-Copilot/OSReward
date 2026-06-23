@@ -324,3 +324,77 @@ def webarena_judgements_records(set_dir, judge_subdir=None):
         yield {"trace_id": tid, "domain": "web", "golden_label": r.get("golden_label"),
                "instruction": _wa_instr_from_text(user_text), "user_text": user_text,
                "image_paths": imgs}
+
+
+# ----------------------------- androidworld -----------------------------
+def _aw_click_xy_norm(tool_call):
+    """(x, y) in 0..1000 for click/long_press actions, else None."""
+    try:
+        tc = json.loads(tool_call) if isinstance(tool_call, str) else tool_call
+        args = (tc or {}).get("arguments", {})
+        if args.get("action") in ("click", "long_press"):
+            c = args.get("coordinate")
+            if isinstance(c, (list, tuple)) and len(c) == 2:
+                return float(c[0]), float(c[1])
+    except Exception:
+        pass
+    return None
+
+
+def _aw_step_line(i, s):
+    th = (s.get("thought") or "").strip()
+    ac = (s.get("action") or "").strip().strip('"')
+    tc = s.get("tool_call") or ""
+    try:
+        tc_str = json.dumps(json.loads(tc).get("arguments", {}), ensure_ascii=False) if tc else ""
+    except Exception:
+        tc_str = str(tc)
+    return f"Step {i}: Thought: {th} Action: {ac}. Tool Call: {tc_str}."
+
+
+def androidworld_records(jsonl_path, last_n=5, root=None):
+    """Yield normalised AndroidWorld (mobile) records from a merged JSONL.
+
+    ``jsonl_path`` is the normalized one-trajectory-per-line file (e.g.
+    ``.../results/merged_normalized_300.jsonl``). Each line carries goal,
+    task_success (1/0 gold), save_dir, and trajectory[{screenshot_path, thought,
+    action, tool_call}]. ``screenshot_path`` is resolved against ``root`` (default:
+    two levels up from the JSONL — the dir holding ``results/`` and the per-agent
+    screenshot folders). Click/long_press coordinates are 0..1000 and are carried
+    through (3rd tuple slot) so a red mark can be scaled to each image.
+    """
+    if root is None:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(jsonl_path)))
+    for line in open(jsonl_path, encoding="utf-8"):
+        line = line.strip()
+        if not line:
+            continue
+        r = json.loads(line)
+        traj = r.get("trajectory", [])
+        if not traj:
+            continue
+        lines, shots = [], []
+        for i, s in enumerate(traj, 1):
+            lines.append(_aw_step_line(i, s))
+            sp = s.get("screenshot_path")
+            if sp:
+                shots.append((sp, _aw_click_xy_norm(s.get("tool_call"))))
+        last = shots[-last_n:] if len(shots) > last_n else shots
+
+        def make_reader(last=last):
+            def _read():
+                out = []
+                for sp, xy in last:
+                    ap = os.path.join(root, sp)
+                    if not os.path.exists(ap):
+                        continue
+                    with open(ap, "rb") as fh:
+                        out.append((fh.read(), os.path.basename(sp), xy))
+                return out
+            return _read
+
+        ts = r.get("task_success")
+        yield {"trace_id": r.get("save_dir") or r.get("task_name"), "domain": "mobile",
+               "instruction": r.get("goal"), "history": "\n".join(lines),
+               "golden_label": "SUCCESS" if ts == 1 else ("FAIL" if ts == 0 else None),
+               "n_steps": len(traj), "read_frames": make_reader()}
