@@ -1,0 +1,4 @@
+openai>=1.40
+Pillow>=10.0
+matplotlib>=3.6
+numpy>=1.24
