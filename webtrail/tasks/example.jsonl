@@ -1,0 +1,4 @@
+{"url": "https://en.wikipedia.org/wiki/Web_browser", "instruction": "Find the release year of the first version of Mosaic mentioned in this article and stop with the answer."}
+{"url": "https://duckduckgo.com", "instruction": "Search for the tallest building in the world and report its height in meters.", "max_steps": 15}
+{"url": "https://arxiv.org", "instruction": "Open the most recent listing for cs.CL and report the title of the first paper.", "steps": ["Open the Computer Science section", "Navigate to Computation and Language recent listings", "Read the first entry"], "criteria": ["The reported title matches the first paper on the recent cs.CL listing page"]}
+{"urls": ["https://www.python.org", "https://pypi.org"], "instruction": "Visit both sites and report the latest stable Python version from python.org and the tagline shown on pypi.org.", "action_profile": "hybrid"}
