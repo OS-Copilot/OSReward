@@ -1,0 +1,20 @@
+{
+  "name": "webtrail-browser-service",
+  "version": "0.1.0",
+  "description": "Session-scoped Playwright browser service with typed page actions and rich page snapshots.",
+  "type": "module",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "check": "node --check src/server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "playwright": "^1.47.0",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  }
+}

@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>webtrail action fidelity harness</title>
+<style>
+  body { font-family: sans-serif; margin: 40px; }
+  .row { margin: 14px 0; }
+  #hover-secret { display: none; }
+  #hover-zone:hover + #hover-secret { display: inline; }
+  #spacer { height: 3000px; background: linear-gradient(#eee, #ccc); }
+  input, select, button { font-size: 16px; padding: 6px; }
+</style>
+</head>
+<body>
+  <h1>Action fidelity harness</h1>
+
+  <div class="row">
+    <button id="click-btn" onclick="this.textContent='clicked:'+(++window.__c)">clicked:0</button>
+    <button id="dbl-btn" ondblclick="this.textContent='dbl:yes'">dbl:no</button>
+  </div>
+
+  <div class="row">
+    <label for="name">Name</label>
+    <input id="name" placeholder="type name here" size="30">
+    <label for="search">Search</label>
+    <input id="search" value="wrongtext" size="30">
+  </div>
+
+  <div class="row">
+    <label for="color">Color</label>
+    <select id="color">
+      <option>Red</option><option>Green</option><option>Blue</option>
+    </select>
+    <label><input type="checkbox" id="agree"> I agree</label>
+  </div>
+
+  <div class="row">
+    <label for="slider">Volume</label>
+    <input type="range" id="slider" min="0" max="100" value="0"
+           style="width: 400px" oninput="document.getElementById('slider-val').textContent=this.value">
+    <span>value: <span id="slider-val">0</span></span>
+  </div>
+
+  <div class="row">
+    <span id="hover-zone" tabindex="0" style="border:1px solid #888; padding: 8px">hover over me</span>
+    <span id="hover-secret">SECRET-REVEALED</span>
+  </div>
+
+  <div id="spacer"></div>
+  <p id="bottom-marker">BOTTOM OF PAGE</p>
+
+  <script>window.__c = 0;</script>
+</body>
+</html>

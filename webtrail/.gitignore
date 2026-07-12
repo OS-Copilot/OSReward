@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.Python
+build/
+dist/
+
+# Collected data: trajectories, screenshots, HTML, api logs, run configs (these
+# contain API keys and machine paths — never commit)
+runs/
+api_logs*/
+api_calls.jsonl
+
+# Node
+node_modules/
+
+# Browser service runtime logs
+browser_service/logs/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
