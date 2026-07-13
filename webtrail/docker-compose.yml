@@ -1,0 +1,39 @@
+# One-command stack: the browser service (long-running) plus the webtrail CLI.
+#
+#   docker compose up -d browser          # start N Playwright workers
+#   docker compose run --rm webtrail doctor --service http://browser:9300
+#   docker compose run --rm webtrail collect \
+#       --tasks tasks/example.jsonl --out runs/demo \
+#       --model <id> --base-url <endpoint> --api-key $KEY \
+#       --service http://browser:9300 --service http://browser:9301
+#
+# WORKERS sets how many browser workers (ports 9300..9300+WORKERS-1) come up;
+# keep the published port range and the --service list in sync with it.
+services:
+  browser:
+    build: ./browser_service
+    environment:
+      WORKERS: ${WORKERS:-4}
+      BASE_PORT: 9300
+    ports:
+      - "9300-9303:9300-9303"
+    shm_size: "1gb"          # Chromium needs a large /dev/shm to avoid crashes
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:9300/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  webtrail:
+    build: .
+    depends_on:
+      browser:
+        condition: service_healthy
+    environment:
+      WEBTRAIL_API_KEY: ${WEBTRAIL_API_KEY:-}
+    volumes:
+      - ./tasks:/app/tasks
+      - ./runs:/app/runs
+    # override the command per invocation with `docker compose run --rm webtrail <args>`
+    command: ["doctor", "--service", "http://browser:9300"]

@@ -53,8 +53,13 @@ def main(args: argparse.Namespace) -> None:
             if judge_path.exists():
                 try:
                     raw = json.loads(judge_path.read_text())
-                    judge = {k: raw.get(k) for k in
-                             ("success", "efficiency", "self_correction")}
+                    judge = {"verdict": raw.get("judge"),
+                             "success": raw.get("success"),
+                             "thought": raw.get("thought")}
+                    # multi-rubric judge also records graded metric floats
+                    for axis in ("alignment_score", "efficiency", "self_correction"):
+                        if raw.get(axis) is not None:
+                            judge[axis] = raw[axis]
                     judged += 1
                 except (ValueError, OSError):
                     pass

@@ -13,6 +13,13 @@ dependencies = [
     "pillow>=10.0",
 ]
 
+[project.optional-dependencies]
+# task import from Hugging Face datasets / parquet (see `webtrail tasks import`)
+data = [
+    "datasets>=2.14",
+    "pyarrow>=14.0",
+]
+
 [project.scripts]
 webtrail = "webtrail.__main__:main"
 

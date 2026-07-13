@@ -17,8 +17,9 @@ scale, with the operational hardening that live-web collection actually needs.
    snapshots: screenshot + HTML + a11y tree
 ```
 
-Pipeline: **collect** → **judge** → **filter**. Each stage is a subcommand and
-writes into the same run directory.
+Pipeline: **tasks import** → **collect** → **judge** → **filter** → **export**,
+with **view** to inspect and **doctor** to check the stack. Each stage is a
+subcommand and writes into the same run directory.
 
 ## Highlights
 
@@ -81,6 +82,26 @@ writes into the same run directory.
 
 ## Setup
 
+### Docker (recommended)
+
+The whole stack comes up with one command — no Node, Playwright, or font setup
+on the host:
+
+```bash
+docker compose up -d browser                      # start the browser workers
+docker compose run --rm webtrail doctor --service http://browser:9300
+docker compose run --rm webtrail collect \
+  --tasks tasks/example.jsonl --out runs/demo \
+  --model <id> --base-url <endpoint> --api-key $KEY \
+  --service http://browser:9300 --service http://browser:9301
+```
+
+`WORKERS` sets how many browser workers start (default 4, on ports
+9300–9303). `tasks/` and `runs/` are mounted, so task files and collected
+trajectories live on the host.
+
+### From source
+
 ```bash
 # browser service
 cd browser_service
@@ -89,8 +110,11 @@ npx playwright install chromium
 WORKERS=4 BASE_PORT=9300 ./start.sh
 
 # python package
-pip install -e .
+pip install -e .          # add [data] for `tasks import` from HF/parquet
 ```
+
+Run `webtrail doctor` any time to check that the browser workers (and, with
+`--base-url`, the model endpoint) are reachable before starting a run.
 
 ### Linux servers
 
@@ -107,6 +131,25 @@ The service runs headless on Linux out of the box:
   present, and skips cleanup if none are — nothing to install.
 
 Node 18+ is required.
+
+## Tasks
+
+Collection reads a small JSONL of `{url, instruction, ...}`. To pull tasks from
+an existing dataset instead of hand-writing them, `tasks import` maps foreign
+column names (`website`, `confirmed_task`, `ques`, `goal`, …) onto that schema,
+drops records missing a URL or instruction, and de-duplicates:
+
+```bash
+# a local file
+webtrail tasks import --source data/mind2web.parquet --out tasks/mind2web.jsonl
+# a Hugging Face dataset (needs the [data] extra)
+webtrail tasks import --source owner/web-agent-tasks --split train \
+  --out tasks/imported.jsonl --limit 500
+```
+
+Columns are auto-detected; override with `--url-field` / `--instruction-field`.
+For open-ended tasks with no fixed site, `--default-url https://duckduckgo.com`
+gives every record a search-engine start URL.
 
 ## Collect
 
@@ -151,12 +194,23 @@ webtrail judge --run runs/demo \
   --concurrency 4 --votes 3
 ```
 
-Scores every trajectory with a VLM judge (`success` / `efficiency` /
-`self_correction`, each 0-1) from the task, the action log, the final answer,
-and the trailing screenshots. `--votes N` samples N times and keeps the
-per-axis median (recommended for RM data — it suppresses single-sample noise on
-borderline runs). Results land in each trajectory's `judge.json`; already-judged
-trajectories are skipped unless `--force`.
+A reward-model-style VLM judge gives every trajectory a binary **SUCCESS** /
+**FAIL** verdict from the task, the action log, the final answer, and the last
+`--last-n` screenshots (default 5, with the click target circled where
+available). It enforces grounding — an answer that reads as guessed or recalled
+rather than read off the page is FAIL even if correct — and marks captcha /
+login-wall / paywall / dead-page runs as FAIL. `--votes N` samples N times and
+keeps the majority verdict (recommended for RM data — it suppresses single-sample
+noise on borderline runs). Results land in each trajectory's `judge.json`
+(`{judge, success, thought}`); already-judged trajectories are skipped unless
+`--force`.
+
+`--rubric multi` switches to a graded reward model: the same SUCCESS / FAIL
+verdict plus four metric floats (0-1) — `alignment_score` (instruction
+adherence), `success` (grounded task completion), `efficiency` (directness), and
+`self_correction` (error recovery). Each metric is the median across `--votes`
+samples. `filter` and `export` surface these extra axes when present, so you can
+select or weight training data on more than a single bit.
 
 ## Curate
 
@@ -173,6 +227,38 @@ sequence + final-screenshot perceptual hash. Output is `manifest.jsonl`.
 `--min-score` gates the rule score; `--min-success` additionally gates on the
 judge's success score where a `judge.json` exists. Select training candidates
 with `bucket == "valid_candidate" && keep == true`.
+
+## Export
+
+Turn kept trajectories into a chat training corpus. Each step becomes a
+user turn (the screenshot the agent saw + its URL) paired with an assistant
+turn (the agent's analysis + the action it took), so the export is a faithful
+multi-turn transcript, not just the final answer.
+
+```bash
+webtrail export --run runs/demo --format messages   # OpenAI-style, images as data URIs
+webtrail export --run runs/demo --format sharegpt    # ShareGPT turns + parallel images list
+```
+
+`--gate keep` (default) exports only the trajectories `filter` marked
+`keep`; `--gate success` uses the judge's SUCCESS verdict; `--gate all` takes
+everything. `--no-embed-images` references screenshots by path instead of
+inlining them.
+
+## View
+
+Build a self-contained HTML browser for a run — no server, open it with
+`file://`:
+
+```bash
+webtrail view --run runs/demo        # writes runs/demo/index.html
+```
+
+The left pane lists every trajectory (coloured by status and judge verdict, with
+a text filter); the right pane steps through screenshots — raw, action-annotated,
+or the exact downscaled model view — alongside the action, the agent's analysis,
+and the judge's thought. Arrow keys navigate steps (←/→) and trajectories (↑/↓).
+Pass a single trajectory directory to `--run` to inspect just that episode.
 
 ## Robustness on the live web
 
@@ -226,6 +312,8 @@ runs/demo/
   api_calls.jsonl        model latency/usage log
   rejects.jsonl          tasks skipped at preflight (unreachable / blocked)
   manifest.jsonl         written by `webtrail filter`
+  index.html             written by `webtrail view` (self-contained browser)
+  export.*.jsonl         written by `webtrail export` (training corpus)
   trajectories/<task_id>/
     task.json
     result.json          status, block info, counters, action keys, timing

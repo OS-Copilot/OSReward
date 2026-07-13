@@ -14,6 +14,11 @@ The judge sees the last N states (screenshots, click point circled where
 available) paired with the action taken at each, plus the task and the agent's
 final answer. Verdicts land in each trajectory's ``judge.json``; `webtrail
 filter` reads them. `--votes N` samples N times and takes the majority verdict.
+
+Two rubrics via ``--rubric``: ``binary`` (default) records just the SUCCESS /
+FAIL verdict; ``multi`` records the same verdict plus graded metric floats
+(``alignment_score`` / ``success`` / ``efficiency`` / ``self_correction``, each
+0-1), with each metric taken as the median across votes.
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ import collections
 import json
 import logging
 import re
+import statistics
 import time
 from pathlib import Path
 
@@ -32,6 +38,86 @@ from .config import ModelSettings
 from .llm import ChatModel, LLMError
 
 logger = logging.getLogger(__name__)
+
+SYSTEM_PROMPT_MULTI = """\
+[ROLE]
+You are a reward model evaluating a GUI agent operating across diverse platforms
+(e.g., Desktop, Web, Mobile). Your job is to determine whether the agent's
+trajectory successfully completes the user's task.
+
+[INPUTS]
+You will receive varying combinations of the following evidence:
+1. User Instruction: The task to be completed.
+2. Visual States: Screenshots from selected steps of the trajectory (e.g., the
+   final few states, or a mix of initial and final states).
+3. Action Logs / History (Optional): The agent's action history, or internal
+   thoughts in text format.
+
+[EVALUATION GOAL & THINKING PATTERN]
+Evaluate the overall task outcome holistically based on the provided visual and
+textual evidence.
+- Subtask Decomposition: Briefly break the instruction down into implied
+  subtasks or rubrics as a reasoning aid.
+- Evidence-Based: The agent operates purely on visual inputs. Your judgment must
+  be grounded in visible UI changes, final screen states, and logged actions.
+(1) General Tasks: For general tasks (e.g., navigational, action-oriented)
+    without specific output requirements, reaching the correct destination page
+    or achieving the intended visual state is sufficient for SUCCESS.
+(2) Explicit Output Tasks: If the instruction explicitly requests a text-based
+    response (e.g., answering a question, providing a filename, or stating a
+    conclusion), the trajectory is SUCCESSFUL only if this specific answer is
+    explicitly produced.
+- Outcome-Focused: Do not require rigid one-to-one confirmation for every
+  subtask. Judge whether the visible end state matches the user's intended goal.
+
+[GROUNDING RULE]
+Facts in an explicit answer (numbers, names, dates, prices, rankings, titles,
+page ranges) must be obtained or verified through interaction with the page, not
+supplied from prior knowledge. An answer that reads as guessed or recalled
+rather than read off a visible state fails the grounding rule, even if correct.
+
+[BLOCKED / IMPOSSIBLE RULE]
+If the task fails because it is <persistently> blocked by external constraints,
+the final judgment must be FAIL, even if the agent behaved logically. Examples:
+- System/OS barriers (e.g., permission)
+- Web/Account barriers (e.g., login walls, CAPTCHAs, paywalls, region restrictions)
+- Environmental failures (e.g., network errors, unavailable pages/apps)
+
+[OUTPUT FORMAT]
+Write a detailed thought process, followed by the exact scoring structure.
+Output strictly in this order:
+
+Thought: <Identify subtasks/rubrics. Explain what visual or textual evidence
+supports or weakens completion. Note any blocking conditions. Evaluate grounding
+compliance. Conclude clearly why it is a SUCCESS or FAIL.>
+
+Metrics:
+{
+  "alignment_score": float,
+  "success": float,
+  "efficiency": float,
+  "self_correction": float
+}
+
+Judge: SUCCESS or FAIL
+
+[SCORING RULES]
+- All metric values must be floats between 0.0 and 1.0.
+- alignment_score (Instruction Adherence): high when actions stay on-task, low
+  with frequent irrelevant exploration or unnecessary steps.
+- success (Task Completion): whether the final outcome matches the goal from
+  visible evidence; must follow the [GROUNDING RULE]; if blocked, success = 0.0.
+- efficiency (Execution Efficiency): high for minimal, direct steps; low for
+  redundant actions, excessive navigation, or looping.
+- self_correction (Error Recovery): high when the agent detects and fixes its
+  own mistakes; if no error occurs, a neutral-to-high score based on stability.
+- Judge must be EXACTLY ONE of: SUCCESS or FAIL.
+- Final Judgment Rule: SUCCESS only if the task is completed AND grounded in
+  observable evidence; FAIL if incomplete, blocked, or grounding is violated
+  (even if the answer is correct).
+- Be conservative: do not assume completion without explicit visual or logged
+  evidence. If uncertain, prefer FAIL."""
+
 
 SYSTEM_PROMPT = """\
 [ROLE]
@@ -102,6 +188,44 @@ def _extract_verdict(text: str) -> tuple[str, str]:
     return label, thought
 
 
+METRIC_KEYS = ("alignment_score", "success", "efficiency", "self_correction")
+
+
+def _clip01(value) -> float | None:
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_metrics(text: str) -> dict:
+    """Pull the Metrics JSON block; fall back to per-key float scraping."""
+    parsed: dict = {}
+    block = re.search(r"metrics\s*:\s*(\{.*?\})", text, re.IGNORECASE | re.DOTALL)
+    if block:
+        try:
+            parsed = json.loads(block.group(1))
+        except ValueError:
+            parsed = {}
+    out: dict = {}
+    for key in METRIC_KEYS:
+        value = _clip01(parsed.get(key))
+        if value is None:                              # scrape "key": 0.8 anywhere
+            hit = re.search(rf'"{key}"\s*:\s*([0-9]*\.?[0-9]+)', text)
+            value = _clip01(hit.group(1)) if hit else None
+        out[key] = value
+    return out
+
+
+def _extract_multi(text: str) -> tuple[str, str, dict]:
+    """Return (verdict, thought, metrics) for the multi-metric rubric."""
+    verdict, _ = _extract_verdict(text)                # robust label parsing
+    tm = re.search(r"thought\s*:\s*(.*?)(?:\n\s*(?:metrics|judge)\s*:|$)",
+                   text, re.IGNORECASE | re.DOTALL)
+    thought = tm.group(1).strip()[:600] if tm else ""
+    return verdict, thought, _extract_metrics(text)
+
+
 def _step_records(traj_dir: Path) -> list[dict]:
     records = []
     for agent_path in sorted((traj_dir / "agent").glob("step_*.json")):
@@ -125,7 +249,7 @@ def _step_records(traj_dir: Path) -> list[dict]:
     return records
 
 
-def build_messages(traj_dir: Path, last_n: int) -> list[dict]:
+def build_messages(traj_dir: Path, last_n: int, style: str = "binary") -> list[dict]:
     task = json.loads((traj_dir / "task.json").read_text())
     result = json.loads((traj_dir / "result.json").read_text())
     steps = _step_records(traj_dir)
@@ -162,42 +286,65 @@ def build_messages(traj_dir: Path, last_n: int) -> list[dict]:
         history,
     ]
     content.append({"type": "text", "text": "\n".join(lines)})
+    system = SYSTEM_PROMPT_MULTI if style == "multi" else SYSTEM_PROMPT
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system},
         {"role": "user", "content": content},
     ]
 
 
 async def judge_trajectory(model: ChatModel, traj_dir: Path, last_n: int,
-                           retries: int = 1, votes: int = 1) -> dict:
-    messages = build_messages(traj_dir, last_n)
+                           retries: int = 1, votes: int = 1,
+                           style: str = "binary") -> dict:
+    messages = build_messages(traj_dir, last_n, style)
     started = time.time()
-    ballots: list[tuple[str, str]] = []
+    ballots: list[dict] = []
     for _ in range(max(1, votes)):
         last_error = None
         for _ in range(retries + 1):
             reply = await model.complete(messages)
             try:
-                ballots.append(_extract_verdict(reply.text))
+                if style == "multi":
+                    verdict, thought, metrics = _extract_multi(reply.text)
+                    ballots.append({"verdict": verdict, "thought": thought,
+                                    "metrics": metrics})
+                else:
+                    verdict, thought = _extract_verdict(reply.text)
+                    ballots.append({"verdict": verdict, "thought": thought})
                 break
             except ValueError as err:
                 last_error = str(err)
         else:
             raise ValueError(f"judge reply unparseable: {last_error}")
 
-    verdicts = [v for v, _ in ballots]
+    verdicts = [b["verdict"] for b in ballots]
     winner = collections.Counter(verdicts).most_common(1)[0][0]
-    thought = next((t for v, t in ballots if v == winner), "")
+    thought = next((b["thought"] for b in ballots if b["verdict"] == winner), "")
     record = {
         "judge": winner,
         "success": 1.0 if winner == "SUCCESS" else 0.0,
         "thought": thought,
         "votes": verdicts if len(verdicts) > 1 else None,
         "model": model.settings.model,
+        "rubric": style,
         "last_n": last_n,
         "latency_s": round(time.time() - started, 2),
         "judged_at": time.time(),
     }
+    if style == "multi":
+        # majority verdict decides SUCCESS/FAIL; each metric is the median across
+        # ballots so a single stray sample can't swing a graded score
+        agg: dict = {}
+        for key in METRIC_KEYS:
+            vals = [b["metrics"][key] for b in ballots if b["metrics"].get(key) is not None]
+            if vals:
+                agg[key] = round(statistics.median(vals), 3)
+            elif key == "success":
+                agg[key] = 1.0 if winner == "SUCCESS" else 0.0
+            else:
+                agg[key] = 0.5                          # neutral when unparseable
+        record.update(agg)                              # includes success (float)
+
     (traj_dir / "judge.json").write_text(
         json.dumps(record, ensure_ascii=False, indent=1),
         encoding="utf-8", errors="replace",
@@ -207,7 +354,7 @@ async def judge_trajectory(model: ChatModel, traj_dir: Path, last_n: int,
 
 async def judge_run(run_dir: Path, settings: ModelSettings, *,
                     concurrency: int, last_n: int, force: bool,
-                    votes: int = 1) -> dict:
+                    votes: int = 1, style: str = "binary") -> dict:
     traj_dirs = [d for d in sorted((run_dir / "trajectories").iterdir())
                  if (d / "result.json").exists()]
     if not force:
@@ -222,7 +369,8 @@ async def judge_run(run_dir: Path, settings: ModelSettings, *,
         nonlocal failures
         async with semaphore:
             try:
-                record = await judge_trajectory(model, traj_dir, last_n, votes=votes)
+                record = await judge_trajectory(model, traj_dir, last_n,
+                                                votes=votes, style=style)
                 tally[record["judge"]] += 1
                 logger.info("%s -> %s", traj_dir.name, record["judge"])
             except (LLMError, ValueError, OSError) as err:
@@ -253,6 +401,10 @@ def add_parser(subparsers) -> None:
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--api-key", default="")
     parser.add_argument("--concurrency", type=int, default=4)
+    parser.add_argument("--rubric", choices=["binary", "multi"], default="binary",
+                        help="binary = SUCCESS/FAIL verdict (default); multi = the "
+                             "same verdict plus alignment_score / success / "
+                             "efficiency / self_correction floats (0-1)")
     parser.add_argument("--last-n", type=int, default=5,
                         help="how many trailing states (screenshot + action) the "
                              "judge sees (default 5)")
@@ -279,6 +431,6 @@ def main(args: argparse.Namespace) -> None:
     summary = asyncio.run(judge_run(
         Path(args.run), settings,
         concurrency=args.concurrency, last_n=args.last_n,
-        force=args.force, votes=args.votes,
+        force=args.force, votes=args.votes, style=args.rubric,
     ))
     print(json.dumps(summary, indent=1))

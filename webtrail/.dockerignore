@@ -1,0 +1,10 @@
+runs/
+**/node_modules/
+browser_service/logs/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.git/
+.DS_Store
+api_calls.jsonl
+api_logs*/
