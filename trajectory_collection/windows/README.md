@@ -1,90 +1,89 @@
-# Windows Agent Arena — 轨迹采集
+# Windows Agent Arena — Trajectory Collection
 
-基于 Windows Agent Arena（WAA）改造的 **GUI Agent 轨迹采集** 仓库：输入问题，让多模态 Agent 在 Windows 虚拟机中逐步执行，并把每一步的截图与模型输出整理进同一个 JSON 文件。
+[English](README.md) | [中文](README_zh.md)
 
-## 环境要求
+Trajectory collection toolkit adapted from Windows Agent Arena (WAA). Given a question / instruction, a multimodal agent runs step-by-step inside a Windows VM; each step’s screenshot and model output are written into one aggregated JSON file.
 
-- Linux 主机（推荐），已安装并可使用 Docker（需支持 KVM：`/dev/kvm`）
-- OpenAI 兼容 API Key（或 Azure OpenAI）
-- Python 3.9+（主机侧仅用于跑脚本依赖；Agent 实际在容器内运行）
-- 可选：本地 `bert-base-uncased` 模型目录（离线跑 GroundingDINO / `som_origin=oss` 时需要）
+## Requirements
 
-## 一、构建与初始化
+- Linux host (recommended) with Docker and KVM (`/dev/kvm`)
+- OpenAI-compatible API key (or Azure OpenAI)
+- Python 3.9+ on the host (for script deps; the agent runs inside the container)
+- Optional: local `bert-base-uncased` (needed for GroundingDINO / `som_origin=oss`)
 
-### 1. 安装主机依赖
+## 1. Build & Setup
+
+### 1.1 Install host dependencies
 
 ```bash
-cd WindowsAgentArena-main
 pip install -r requirements.txt
 ```
 
-### 2. 配置 API Key
+### 1.2 Configure API keys
 
-在仓库根目录创建或编辑 `config.json`：
+Create `config.json` at the repo root of this directory:
 
 ```json
 {
-    "OPENAI_API_KEY": "<你的 API Key>",
+    "OPENAI_API_KEY": "<YOUR_API_KEY>",
     "OPENAI_BASE_URL": "https://api.openai.com/v1",
     "AZURE_API_KEY": "",
     "AZURE_ENDPOINT": ""
 }
 ```
 
-优先使用 `OPENAI_API_KEY` + `OPENAI_BASE_URL`；也可改用 Azure 字段。
+`OPENAI_API_KEY` + `OPENAI_BASE_URL` take priority; Azure fields are optional alternatives.
 
-### 3. 准备 Docker 镜像
+### 1.3 Build Docker images
 
 ```bash
-# 拉取基础镜像
 docker pull windowsarena/winarena-base:latest
 
-# 构建本仓库的 winarena 镜像（包含 src 代码）
 cd scripts
 ./build-container-image.sh
 ```
 
-构建完成后本地应有镜像：`windowsarena/winarena:latest`。
+You should then have `windowsarena/winarena:latest` locally.
 
-### 4. 准备 Windows 11 金镜像（首次必须）
+### 1.4 Prepare the Windows 11 golden image (first time only)
 
-1. 从 [Microsoft Evaluation Center](https://info.microsoft.com/ww-landing-windows-11-enterprise.html) 下载 **Windows 11 Enterprise Evaluation** ISO（约 6GB）
-2. 重命名为 `setup.iso`，放到：
+1. Download a **Windows 11 Enterprise Evaluation** ISO (~6GB) from the [Microsoft Evaluation Center](https://info.microsoft.com/ww-landing-windows-11-enterprise.html).
+2. Rename it to `setup.iso` and place it at:
 
 ```text
 src/win-arena-container/vm/image/setup.iso
 ```
 
-3. 启动自动安装（约 20 分钟，过程中不要手动操作 VM）：
+3. Run the automated install (~20 minutes; do not interact with the VM):
 
 ```bash
 cd scripts
 ./run-local.sh --prepare-image true
 ```
 
-进度可在浏览器打开：`http://localhost:8006`。
+Monitor progress at `http://localhost:8006`.
 
-完成后，金镜像文件会出现在：
+When finished, the golden image lives under:
 
 ```text
 src/win-arena-container/vm/storage/
 ```
 
-建议把该目录备份到仓库外，避免以后被误改后重装。
+Back up this folder outside the repo so you can recover if the VM is corrupted.
 
-> 若本机用户不在 `docker` 组，可用 `sg docker -c './run-local.sh ...'`，或把用户加入 docker 组后重新登录。
+> If your user is not in the `docker` group, use `sg docker -c './run-local.sh ...'` or re-login after joining the group.
 
-## 二、采集轨迹
+## 2. Collect Trajectories
 
-整体流程：
+Pipeline:
 
-1. 启动带 Windows VM 的容器（不自动跑评测）
-2. 在容器内执行 `run_collect.py`
-3. 得到 `collection.json` + 逐步截图
+1. Start the container with the Windows VM (no evaluation / no auto-collect).
+2. Run `run_collect.py` inside the container.
+3. Get `collection.json` plus per-step screenshots.
 
-### 1. 编写问题文件
+### 2.1 Write a questions file
 
-示例：`src/win-arena-container/client/collection_examples/questions.json`
+Example: `src/win-arena-container/client/collection_examples/questions.json`
 
 ```json
 {
@@ -98,15 +97,15 @@ src/win-arena-container/vm/storage/
 }
 ```
 
-支持的格式：
+Supported shapes:
 
-- 字符串列表：`["问题1", "问题2"]`
-- 对象列表：`[{"id": "...", "instruction": "..."}]`
-- 带 `questions` 字段的对象（如上）
+- list of strings: `["q1", "q2"]`
+- list of objects: `[{"id": "...", "instruction": "..."}]`
+- object with a `questions` field (as above)
 
-如需下载文件等环境初始化，可在问题对象里加 `config`（写法与原 WAA 任务配置相同）。
+For environment setup (e.g. file downloads), add a `config` field using the same schema as original WAA tasks.
 
-### 2. 启动 Windows 环境
+### 2.2 Start the Windows environment
 
 ```bash
 cd scripts
@@ -117,9 +116,9 @@ cd scripts
   --container-name winarena
 ```
 
-等待日志出现 `VM started, server ready`。可用浏览器 `http://localhost:8006` 查看桌面。
+Wait until the log shows `VM started, server ready`. Open `http://localhost:8006` to view the desktop.
 
-### 3. 在容器内开始采集
+### 2.3 Run collection inside the container
 
 ```bash
 docker exec -w /client winarena python run_collect.py \
@@ -131,7 +130,7 @@ docker exec -w /client winarena python run_collect.py \
   --output_dir ./collection_results
 ```
 
-单个问题也可以：
+Single question:
 
 ```bash
 docker exec -w /client winarena python run_collect.py \
@@ -142,7 +141,7 @@ docker exec -w /client winarena python run_collect.py \
   --output_dir ./collection_results
 ```
 
-或使用封装脚本（容器内）：
+Or use the helper script:
 
 ```bash
 docker exec winarena bash /start_collect.sh \
@@ -151,29 +150,29 @@ docker exec winarena bash /start_collect.sh \
   --som-origin a11y
 ```
 
-### 4. 常用参数
+### 2.4 Common flags
 
-| 参数 | 含义 | 默认 |
-|------|------|------|
-| `--questions_path` | 问题 JSON 路径 | 无（与 `--question` 二选一） |
-| `--question` | 单个问题字符串 | 无 |
-| `--output_dir` | 输出目录 | `./collection_results` |
-| `--output_json` | 汇总 JSON 路径 | `<output_dir>/collection.json` |
-| `--model` | 模型名 | `gpt-4-vision-preview` |
-| `--som_origin` | 屏幕解析来源：`a11y` / `oss` / … | `oss` |
-| `--max_steps` | 每个问题最大步数 | `15` |
-| `--embed_base64` | 截图以 base64 写入 JSON | 关闭 |
-| `--save_user_question` | 额外保存发给模型的 prompt | 关闭 |
+| Flag | Meaning | Default |
+|------|---------|---------|
+| `--questions_path` | Path to questions JSON | none (use `--question` instead) |
+| `--question` | Single question string | none |
+| `--output_dir` | Output directory | `./collection_results` |
+| `--output_json` | Aggregated JSON path | `<output_dir>/collection.json` |
+| `--model` | Model name | `gpt-4-vision-preview` |
+| `--som_origin` | Screen parsing: `a11y` / `oss` / … | `oss` |
+| `--max_steps` | Max steps per question | `15` |
+| `--embed_base64` | Embed screenshots as base64 in JSON | off |
+| `--save_user_question` | Also save the prompt sent to the model | off |
 
-推荐采集时用 `--som_origin a11y`（更稳）；`oss` 依赖本地 BERT / GroundingDINO，更重。
+Prefer `--som_origin a11y` for collection (more stable). `oss` needs local BERT / GroundingDINO and is heavier.
 
-### 5. 输出结果
+### 2.5 Output layout
 
-默认输出目录（挂载到宿主机）：
+Default output (mounted to the host):
 
 ```text
 src/win-arena-container/client/collection_results/
-├── collection.json          # 所有问题的轨迹汇总
+├── collection.json
 ├── screenshots/
 │   └── <question_id>/
 │       ├── step_0.png
@@ -182,7 +181,7 @@ src/win-arena-container/client/collection_results/
 └── logs/
 ```
 
-`collection.json` 结构概要：
+`collection.json` sketch:
 
 ```json
 {
@@ -191,13 +190,13 @@ src/win-arena-container/client/collection_results/
   "episodes": [
     {
       "id": "open_notepad_hello",
-      "instruction": "问题文本",
+      "instruction": "question text",
       "steps": [
         {
           "step": 0,
           "screenshot": "screenshots/open_notepad_hello/step_0.png",
-          "model_output": "模型完整输出",
-          "action": "解析出的动作代码",
+          "model_output": "full model output",
+          "action": "parsed action code",
           "done": false
         }
       ],
@@ -208,93 +207,94 @@ src/win-arena-container/client/collection_results/
 }
 ```
 
-说明：
+Notes:
 
-- 每一步记录的是**模型决策时看到的截图**（动作执行前）
-- 截图默认存 PNG，JSON 里写相对路径
-- 采集过程增量写盘，中断后已完成的 episode 仍会保留
+- Each step stores the screenshot **seen by the model** (pre-action).
+- Screenshots are PNG files by default; JSON stores relative paths.
+- The JSON is flushed incrementally; finished episodes survive interrupts.
 
-## 三、只开桌面（安装软件并持久化）
+## 3. Desktop-only Mode (install software & persist)
 
-Windows 磁盘挂载在宿主机目录 `src/win-arena-container/vm/storage/`。只要**正常关机**再停容器，装过的软件下次启动还在。
+The Windows disk is bind-mounted at `src/win-arena-container/vm/storage/`. If you **shut down Windows cleanly** before stopping the container, installed software persists.
 
-### 1. 启动桌面（不采集）
+### 3.1 Start desktop (no collection)
 
 ```bash
 cd scripts
 ./start-desktop.sh
 ```
 
-等日志出现 `VM started, server ready` 后：
+After `VM started, server ready`:
 
-- 浏览器打开：`http://localhost:8006`
-- 或用 RDP 连接：`localhost:3390`
+- Browser: `http://localhost:8006`
+- RDP: `localhost:3390`
 
-在里面像普通 Windows 一样安装软件、改设置。
+Install apps / change settings like a normal Windows machine.
 
-### 2. 保存并关闭（重要）
+### 3.2 Save & stop (important)
 
-**不要**直接 `docker stop` / `docker kill`（可能丢未落盘改动）。用：
+Do **not** use a raw `docker stop` / `docker kill` (unsynced disk writes may be lost). Use:
 
 ```bash
 cd scripts
 ./stop-desktop.sh
 ```
 
-脚本会：
+This will:
 
-1. 调用 VM 内 `POST /shutdown` 让 Windows 正常关机  
-2. 等待约 3 分钟把改写刷进 `storage/`  
-3. 再 `docker stop` 容器  
+1. Call `POST /shutdown` inside the VM for a graceful Windows shutdown  
+2. Wait ~3 minutes for the disk flush into `storage/`  
+3. Then `docker stop` the container  
 
-### 3. 下次再用
+### 3.3 Next time
 
-再次 `./start-desktop.sh` 或跑采集，都会加载同一份 `vm/storage/`，之前装的软件还在。
+`./start-desktop.sh` or collection runs reuse the same `vm/storage/`, so installed software remains.
 
-建议定期把整个 `src/win-arena-container/vm/storage/` 备份到仓库外。
+Periodically back up `src/win-arena-container/vm/storage/` outside the repo.
 
-## 四、日常常用命令
+## 4. Everyday Commands
 
 ```bash
 cd scripts
 
-# 只开桌面装软件
+# Desktop only
 ./start-desktop.sh
 ./stop-desktop.sh
 
-# 开环境后自己进容器采轨迹
+# Start env, then collect manually
 ./run-local.sh --skip-build true --start-client false
 docker exec -w /client winarena python run_collect.py ...
 
-# 查看容器
 docker ps | grep winarena
 ```
 
-代码改动在 `src/win-arena-container/client/` 下时，因该目录已挂载进容器，一般**不用重建镜像**即可生效；改动容器系统层或 Dockerfile 时再执行 `./build-container-image.sh`。
+Edits under `src/win-arena-container/client/` are bind-mounted and usually apply **without** rebuilding the image. Rebuild with `./build-container-image.sh` only when Dockerfile / system layers change.
 
-## 五、目录说明
+## 5. Layout
 
 ```text
-WindowsAgentArena-main/
-├── config.json                          # API 配置
+.
+├── config.json                          # API config (gitignored)
+├── README.md                            # English (default)
+├── README_zh.md                         # Chinese
 ├── scripts/
-│   ├── build-container-image.sh         # 构建镜像
-│   ├── run-local.sh                     # 启动/准备环境
-│   ├── start-desktop.sh                 # 只开桌面（装软件）
-│   └── stop-desktop.sh                  # 正常关机并落盘
+│   ├── build-container-image.sh
+│   ├── run-local.sh
+│   ├── start-desktop.sh
+│   └── stop-desktop.sh
 └── src/win-arena-container/
-    ├── start_collect.sh                 # 容器内采集入口
+    ├── start_collect.sh
     ├── client/
-    │   ├── run_collect.py               # 采集主程序
+    │   ├── run_collect.py
     │   ├── lib_run_collect.py
     │   ├── collection_recorder.py
-    │   ├── collection_examples/         # 示例问题
-    │   └── collection_results/          # 采集输出（运行后生成）
+    │   ├── collection_examples/
+    │   └── collection_results/
     └── vm/
-        ├── image/setup.iso              # Windows 安装盘（需自行放入）
-        └── storage/                     # 金镜像 + 持久化磁盘（软件装这里）
+        ├── image/setup.iso
+        └── storage/                     # golden image + persisted disk
 ```
 
 ## License
 
-本仓库基于原 Windows Agent Arena 项目改造，遵循原项目 [MIT License](LICENSE)。
+Adapted from Windows Agent Arena under the original [MIT License](LICENSE).
