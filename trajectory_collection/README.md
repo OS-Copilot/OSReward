@@ -6,7 +6,7 @@ SFT / reward-model training corpora.
 | Platform | Directory | Status |
 |----------|-----------|--------|
 | Web | [`webtrail/`](webtrail/) | Working: task import, rollout, judging, curation, export |
-| Windows | [`windows/`](windows/) | Placeholder |
+| Windows | [`windows/`](windows/) | Working: WAA-based collect (screenshots + model outputs → JSON) |
 | Ubuntu | [`ubuntu/`](ubuntu/) | Placeholder |
 | Mobile (Android) | [`mobile/`](mobile/) | Placeholder |
 
