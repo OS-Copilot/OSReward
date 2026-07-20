@@ -298,7 +298,7 @@ class DesktopEnv(gym.Env):
         done = False  # todo: Define episode termination condition for each example
         info = {}
         # handle the special actions
-        if action in ['WAIT', 'FAIL', 'DONE']:
+        if action in ['WAIT', 'FAIL', 'DONE'] or (isinstance(action, str) and action.startswith('ANSWER::')) or action == 'ANSWER':
             if action == 'WAIT':
                 time.sleep(pause)
             elif action == 'FAIL':
@@ -307,6 +307,12 @@ class DesktopEnv(gym.Env):
             elif action == 'DONE':
                 done = True
                 info = {"done": True}
+            elif isinstance(action, str) and action.startswith('ANSWER::'):
+                done = True
+                info = {"answer": action.split('ANSWER::', 1)[1]}
+            elif action == 'ANSWER':
+                done = True
+                info = {"answer": None}
         else:
             if self.action_space == "computer_13":
                 # the set of all possible actions defined in the action representation

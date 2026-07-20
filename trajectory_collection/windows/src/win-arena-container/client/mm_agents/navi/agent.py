@@ -408,6 +408,9 @@ class NaviAgent:
         if memory_block:
             self.memory_block_text = '```memory\n' + memory_block.group(1) + '```'
 
+        answer_block = re.search(r'```answer\n(.*?)```', plan_result, re.DOTALL)
+        answer_text = answer_block.group(1).strip() if answer_block else None
+
         # extract the plan which is in a ```python ...``` code block
         code_block = re.search(r'```python\n(.*?)```', plan_result, re.DOTALL)
         if code_block:
@@ -448,6 +451,8 @@ class NaviAgent:
                 actions = ["FAIL"]
             elif "WAIT" in self.decision_block_text:
                 actions = ["WAIT"]
+            elif "ANSWER" in self.decision_block_text:
+                actions = [f"ANSWER::{answer_text}" if answer_text is not None else "ANSWER"]
 
         return response, actions, logs, computer_update_args
 

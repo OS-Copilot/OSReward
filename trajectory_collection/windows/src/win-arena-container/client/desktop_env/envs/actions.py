@@ -199,5 +199,9 @@ ACTION_SPACE = [
     {
         "action_type": "DONE",
         "note": "decide the task is done",
+    },
+    {
+        "action_type": "ANSWER",
+        "note": "provide the final textual answer and end the episode",
     }
 ]

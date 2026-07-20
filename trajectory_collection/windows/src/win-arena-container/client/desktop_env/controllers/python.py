@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import random
 from typing import Any, Dict, Optional
 
@@ -164,6 +165,8 @@ class PythonController:
         It can be used to execute the pyautogui commands, or... any other python command. who knows?
         """
 
+        command = self._translate_extended_computer_calls(command)
+
         if command in ['WAIT', 'FAIL', 'DONE']:
             return
 
@@ -183,6 +186,39 @@ class PythonController:
             return response.json()
         except requests.exceptions.RequestException as e:
             logger.error("An error occurred while trying to execute the command: %s", e)
+
+    def _translate_extended_computer_calls(self, command: str) -> str:
+        """
+        Translate a few helper calls that are not implemented directly by the
+        remote execution environment into equivalent Python code.
+        """
+
+        wait_pattern = re.compile(r"(^|\n)([ \t]*)computer\.wait\(\s*(?:time\s*=\s*)?([0-9]+(?:\.[0-9]+)?)\s*\)")
+        if wait_pattern.search(command):
+            if "import time" not in command:
+                command = "import time\n" + command
+
+            command = wait_pattern.sub(
+                lambda match: f"{match.group(1)}{match.group(2)}time.sleep({float(match.group(3)) / 1000.0})",
+                command,
+            )
+
+        drag_pattern = re.compile(
+            r"(^|\n)([ \t]*)computer\.mouse\.drag\(\s*x1\s*=\s*([-+]?(?:\d*\.\d+|\d+))\s*,\s*"
+            r"y1\s*=\s*([-+]?(?:\d*\.\d+|\d+))\s*,\s*"
+            r"x2\s*=\s*([-+]?(?:\d*\.\d+|\d+))\s*,\s*"
+            r"y2\s*=\s*([-+]?(?:\d*\.\d+|\d+))\s*\)"
+        )
+
+        def drag_replacement(match: re.Match) -> str:
+            prefix, indent, x1, y1, x2, y2 = match.groups()
+            return (
+                f"{prefix}{indent}computer.mouse.move_abs(x={x1}, y={y1})\n"
+                f"{indent}computer.mouse.drag(x={x2}, y={y2})"
+            )
+
+        command = drag_pattern.sub(drag_replacement, command)
+        return command
 
     def execute_python_command(self, command: str) -> None:
         """
