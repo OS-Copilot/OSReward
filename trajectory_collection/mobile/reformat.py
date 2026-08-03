@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Reformat extracted AndroidWorld episodes into the unified trajectory schema.
+"""Reformat extracted episodes into the unified OSReward trajectory schema.
 
-Input: the per-episode directories produced by extract_episodes.py, each
-holding {task_template}_{instance_id}.json plus per-step PNGs.
-Output: one JSON per episode in the unified OSReward schema (trace_id,
-instruction, trajectory steps with state / action / prm_label, orm_label).
+Input: the per-episode directories produced by extract_episodes.py
+(`{task}_{instance}_{timestamp}/` holding `<dir>.json` plus per-step PNGs
+named `{task}_{instance}_{step:04d}.png`), recorded by the tool-call
+collection agent (android_world.agents.seeact.ToolCallAgent).
+
+Output: one JSON per episode in the unified schema (trace_id, instruction,
+trajectory steps with state / action / thought / prm_label, orm_label).
 
 Usage:
   python reformat.py --root /path/to/extracted --out_root /path/to/reformatted
@@ -14,14 +17,14 @@ import argparse
 import json
 import os
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 AGENT_METADATA = {
-    "producer": "Anthropic",
-    "model_name": "claude-sonnet-4-5-20250929",
+    "producer": "",
+    "model_name": "",
     "prompt_version": "",
 }
-SOURCE = "AndroidWorld"
+SOURCE = "AndroidWorld-Ext"
 PLATFORM = "Mobile"
 IN_DOMAIN = "0"
 
@@ -41,212 +44,146 @@ def mirror_output_path(in_path: str, in_root: str, out_root: str) -> str:
     return os.path.join(out_root, os.path.relpath(in_path, start=in_root))
 
 
-def _coord_from_bbox_element(elem: Dict[str, Any],
-                             sw: Optional[int],
-                             sh: Optional[int]) -> Dict[str, Any]:
-    """Returns the bbox-center coordinate of an a11y element.
+def sanitize_name(name: str) -> str:
+    """Same sanitization as extract_episodes.py, for filename reconstruction."""
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
 
-    Output: {"absolute": [x, y], "relative": [rx, ry]} in pixels / fractions.
-    """
-    bbox = (elem or {}).get("bbox_pixels") or {}
-    x_min = bbox.get("x_min")
-    x_max = bbox.get("x_max")
-    y_min = bbox.get("y_min")
-    y_max = bbox.get("y_max")
 
-    if None in (x_min, x_max, y_min, y_max):
+def _tag(text: str, tag: str) -> Optional[str]:
+    m = re.search(rf"<{tag}>\s*([\s\S]*?)\s*</{tag}>", text or "")
+    return m.group(1) if m else None
+
+
+def _coord(x: Any, y: Any, sw: Optional[int], sh: Optional[int]) -> Dict[str, Any]:
+    if x is None or y is None:
         return {"absolute": [None, None], "relative": [None, None]}
-
-    x = 0.5 * (float(x_min) + float(x_max))
-    y = 0.5 * (float(y_min) + float(y_max))
-
-    ax = int(round(x))
-    ay = int(round(y))
-    rx = round(x / float(sw), 6) if sw else None
-    ry = round(y / float(sh), 6) if sh else None
-
+    ax, ay = int(round(float(x))), int(round(float(y)))
+    rx = round(float(x) / sw, 6) if sw else None
+    ry = round(float(y) / sh, 6) if sh else None
     return {"absolute": [ax, ay], "relative": [rx, ry]}
 
 
-def parse_action_from_raw_response(
-    raw_response: str,
-    a11y_tree: Optional[List[Dict[str, Any]]],
-    sw: Optional[int],
-    sh: Optional[int],
-) -> Dict[str, Any]:
-    """Extracts the AndroidWorld action from the raw model response.
-
-    Expected format: 'Action: {"action_type": "status", "goal_status": ...}'.
-    """
-    if not raw_response:
+def convert_action(parsed: Optional[Dict[str, Any]],
+                   sw: Optional[int], sh: Optional[int]) -> Dict[str, Any]:
+    """Maps a ToolCallAgent JSONAction dict onto the unified action schema."""
+    if not isinstance(parsed, dict):
         return {"type": "unknown"}
 
-    m = re.search(r"Action:\s*(\{.*\})", raw_response)
-    if not m:
-        return {"type": "unknown"}
+    a = (parsed.get("action_type") or "").lower()
 
-    try:
-        action_json = json.loads(m.group(1))
-    except Exception:
-        return {"type": "unknown"}
-
-    action_type = action_json.get("action_type", "").upper()
-
-    if action_type == "STATUS":
-        gs = (action_json.get("goal_status") or "").upper()
-        if gs == "COMPLETE":
-            return {"type": "answer", "content": "COMPLETE"}
-        elif gs in ("FAILED", "FAIL", "INCOMPLETE"):
-            return {"type": "answer", "content": "FAILED"}
-        elif gs in ("IMPOSSIBLE", "UNACHIEVABLE"):
-            return {"type": "answer", "content": "IMPOSSIBLE"}
-        else:
-            return {"type": "answer", "content": gs}
-
-    if action_type == "CLICK":
-        idx = action_json.get("index")
-        coords: List[Dict[str, Any]] = []
-        if isinstance(idx, int) and a11y_tree and 0 <= idx < len(a11y_tree):
-            coords.append(_coord_from_bbox_element(a11y_tree[idx], sw, sh))
-        return {"type": "click", "coordinates": coords}
-
-    if action_type == "SCROLL":
-        idx = action_json.get("index")
-        direction = action_json.get("direction", "").lower()
-        coords = []
-        if isinstance(idx, int) and a11y_tree and 0 <= idx < len(a11y_tree):
-            coords.append(_coord_from_bbox_element(a11y_tree[idx], sw, sh))
-        return {"type": "scroll", "coordinates": coords, "direction": direction}
-
-    if action_type == "INPUT_TEXT":
-        text = action_json.get("text") or action_json.get("value") or ""
-        return {"type": "type", "content": text}
-
-    if action_type == "KEYBOARD_ENTER":
+    if a == "click":
+        return {"type": "click",
+                "coordinates": [_coord(parsed.get("x"), parsed.get("y"), sw, sh)]}
+    if a == "long_press":
+        return {"type": "longpress",
+                "coordinates": [_coord(parsed.get("x"), parsed.get("y"), sw, sh)]}
+    if a == "scroll":
+        return {"type": "scroll", "coordinates": [],
+                "direction": (parsed.get("direction") or "").lower()}
+    if a == "input_text":
+        return {"type": "type", "content": parsed.get("text") or ""}
+    if a == "keyboard_enter":
         return {"type": "hotkey", "keys": ["enter"]}
-
-    if action_type == "NAVIGATE_BACK":
+    if a == "navigate_back":
         return {"type": "hotkey", "keys": ["back"]}
-
-    if action_type == "NAVIGATE_HOME":
+    if a == "navigate_home":
         return {"type": "hotkey", "keys": ["home"]}
-
-    if action_type == "LONG_PRESS":
-        return {"type": "longpress", "coordinates": []}
-
-    if action_type == "WAIT":
+    if a == "open_app":
+        return {"type": "open_app", "appname": parsed.get("app_name") or ""}
+    if a == "answer":
+        return {"type": "answer", "text": parsed.get("text") or ""}
+    if a == "wait":
         return {"type": "wait"}
+    if a == "status":
+        gs = (parsed.get("goal_status") or "").lower()
+        if gs == "complete":
+            return {"type": "answer", "content": "COMPLETE"}
+        if gs == "infeasible":
+            return {"type": "answer", "content": "IMPOSSIBLE"}
+        return {"type": "answer", "content": gs.upper()}
 
-    if action_type == "ANSWER":
-        content = action_json.get("content") or ""
-        return {"type": "answer", "text": content}
-
-    if action_type == "OPEN_APP":
-        appname = action_json.get("app_name") or ""
-        return {"type": "open_app", "appname": appname}
-
-    return {"type": "unknown", "original": action_json}
+    return {"type": "unknown", "original": parsed}
 
 
-def process_episode(path: str, agent_metadata: Dict[str, str]) -> List[Tuple[Optional[str], Dict]]:
-    """Converts one extracted episode JSON to the unified schema.
-
-    - trace_id = name of the directory containing the json.
-    - screenshot_path = trace_id/trace_id_{step:04d}.png
-    - state.a11y_tree = before_element_list[step]; after_elements are ignored.
-    """
+def process_episode(path: str, agent_metadata: Dict[str, str]) -> Optional[Dict[str, Any]]:
+    """Converts one extracted episode JSON to the unified schema."""
     payload = load_json(path)
-    if not isinstance(payload, dict):
-        return []
+    if not isinstance(payload, dict) or "episode_data" not in payload:
+        return None
 
     episode_data = payload.get("episode_data", {}) or {}
-    screen_config = payload.get("screen_config", {}) or {}
 
-    before_elements = episode_data.get("before_element_list") or []
-    action_prompt = episode_data.get("action_prompt") or []
-    action_output = episode_data.get("action_output") or []
-    action_raw_response = episode_data.get("action_raw_response") or []
-    summary = episode_data.get("summary") or []
+    responses = episode_data.get("response") or []
+    parsed_list = episode_data.get("parsed") or []
+    histories = episode_data.get("step_history") or []
+    summaries = episode_data.get("summary") or []
+    widths = episode_data.get("screen_width") or []
+    heights = episode_data.get("screen_height") or []
 
-    n_steps = max(
-        len(before_elements),
-        len(action_prompt),
-        len(action_output),
-        len(action_raw_response),
-        len(summary),
-    ) or 0
+    n_steps = max(len(responses), len(parsed_list), len(histories)) or 0
+    if n_steps == 0:
+        return None
 
-    sw = screen_config.get("width")
-    sh = screen_config.get("height")
+    sw = next((w for w in widths if w), None)
+    sh = next((h for h in heights if h), None)
 
     trace_id = os.path.basename(os.path.dirname(path)) or os.path.splitext(
         os.path.basename(path))[0]
 
+    task_template = payload.get("task_template") or ""
     instance_id = payload.get("instance_id")
     instance_id_str = str(instance_id) if instance_id is not None else "0"
-
     goal = payload.get("goal") or ""
-    task_template = payload.get("task_template")
-    task_id_field = task_template or goal or instance_id_str
+    png_prefix = f"{sanitize_name(task_template)}_{instance_id_str}"
 
     trajectory: List[Dict[str, Any]] = []
-
     for idx in range(n_steps):
-        screenshot_path = f"{trace_id}/{trace_id}_{idx:04d}.png"
-        a11y_tree = before_elements[idx] if idx < len(before_elements) else None
+        response = responses[idx] if idx < len(responses) else ""
+        response = response if isinstance(response, str) else str(response)
+        parsed = parsed_list[idx] if idx < len(parsed_list) else None
 
-        # Flatten action_raw_response[idx] (an Anthropic-shaped message) to text.
-        rr = ""
-        if idx < len(action_raw_response):
-            rr_item = action_raw_response[idx]
-            if isinstance(rr_item, dict):
-                content = rr_item.get("content")
-                if isinstance(content, list) and content and isinstance(content[0], dict):
-                    text = content[0].get("text")
-                    rr = text if isinstance(text, str) else ""
-                else:
-                    rr = json.dumps(rr_item, ensure_ascii=False)
-            else:
-                rr = str(rr_item)
-
-        thought = ""
-        if idx < len(summary) and summary[idx]:
-            thought = str(summary[idx])
-        elif idx < len(action_prompt) and action_prompt[idx]:
-            thought = str(action_prompt[idx])
+        thought = {
+            "thinking": _tag(response, "thinking"),
+            "conclusion": _tag(response, "conclusion"),
+        }
+        summary = summaries[idx] if idx < len(summaries) else None
 
         trajectory.append({
             "step_index": idx,
             "state": {
-                "screenshot_path": screenshot_path,
-                "a11y_tree": a11y_tree,
+                "screenshot_path": f"{trace_id}/{png_prefix}_{idx:04d}.png",
             },
-            "raw_response": rr,
+            "raw_response": response,
             "thought": thought,
-            "action": parse_action_from_raw_response(rr, a11y_tree, sw, sh),
+            "summary": summary,
+            "action": convert_action(parsed, sw, sh),
             "prm_label": {"is_error": False, "correction": None},
         })
 
-    transformed = {
+    is_successful = payload.get("is_successful")
+
+    return {
         "trace_id": trace_id,
-        "task_id": task_id_field,
+        "task_id": task_template or goal or instance_id_str,
         "task_source": SOURCE,
         "in_domain": IN_DOMAIN,
         "platform": PLATFORM,
-        "subdomain": screen_config.get("config_name") or "",
+        "subdomain": "",
         "environment_details": {
             "screen_resolution": f"{sw}x{sh}" if sw and sh else "",
             "os_version": "",
             "browser_name": "",
             "browser_version": "",
         },
-        "instruction": goal or "",
+        "instruction": goal,
         "agent_metadata": agent_metadata,
         "held_out": 0,
         "trajectory": trajectory,
         "trajectory_length": len(trajectory),
         "orm_label": {
-            "score": None,
+            # The task's own validator verdict; annotate_binary_reward.py can
+            # overwrite binary_reward with a manually verified label.
+            "score": is_successful,
             "binary_reward": None,
             "rationale": "",
         },
@@ -257,20 +194,17 @@ def process_episode(path: str, agent_metadata: Dict[str, str]) -> List[Tuple[Opt
         },
     }
 
-    return [(None, transformed)]
-
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Reformat extracted AndroidWorld episodes.")
+        description="Reformat extracted episodes into the unified schema.")
     parser.add_argument("--root", required=True,
                         help="Input root (output of extract_episodes.py)")
     parser.add_argument("--out_root", required=True, help="Output root")
-    parser.add_argument("--model_name", default=AGENT_METADATA["model_name"],
-                        help="Model id recorded in agent_metadata")
+    parser.add_argument("--model_name", default="",
+                        help="Model id for agent_metadata; defaults to the"
+                             " episode's recorded agent_name")
     args = parser.parse_args()
-
-    agent_metadata = dict(AGENT_METADATA, model_name=args.model_name)
 
     count = 0
     for dirpath, _, filenames in os.walk(args.root):
@@ -280,17 +214,22 @@ def main():
         for fname in filenames:
             if not fname.lower().endswith(".json"):
                 continue
-
             in_path = os.path.join(dirpath, fname)
             try:
-                for (out_name, data) in process_episode(in_path, agent_metadata):
-                    target_name = out_name if out_name else fname
-                    out_path = mirror_output_path(
-                        os.path.join(dirpath, target_name), args.root, args.out_root)
-                    if os.path.exists(out_path):
-                        continue
-                    save_json(out_path, data)
-                    count += 1
+                payload_model = args.model_name
+                data = load_json(in_path)
+                if not payload_model and isinstance(data, dict):
+                    payload_model = data.get("agent_name") or ""
+                agent_metadata = dict(AGENT_METADATA, model_name=payload_model)
+
+                result = process_episode(in_path, agent_metadata)
+                if result is None:
+                    continue
+                out_path = mirror_output_path(in_path, args.root, args.out_root)
+                if os.path.exists(out_path):
+                    continue
+                save_json(out_path, result)
+                count += 1
             except Exception as e:
                 print(f"[ERROR] {fname}: {e}")
 

@@ -17,7 +17,10 @@
 import dataclasses
 import random
 from typing import Any, Callable, Optional
+from android_world.env import adb_utils
 from android_world.env import device_constants
+from android_world.env import interface
+from android_world.task_evals import task_eval
 from android_world.task_evals.common_validators import sqlite_validators
 from android_world.task_evals.single.calendar import calendar_evaluators
 from android_world.task_evals.single.calendar import calendar_utils
@@ -416,3 +419,68 @@ class SimpleCalendarDeleteEventsOnRelativeDay(SimpleCalendarDeleteEvents):
         sqlite_validators.ROW_OBJECTS: events,
         sqlite_validators.NOISE_ROW_OBJECTS: noise_events,
     }
+
+
+class _SimpleCalendarFreeform(task_eval.TaskEval):
+  """Base class for freeform Simple Calendar Pro tasks."""
+
+  app_names = ('simple calendar pro',)
+  schema = {'type': 'object', 'properties': {}}
+
+  def initialize_task(self, env: interface.AsyncEnv):
+    env.interaction_cache = ""
+    self.initialize_device_time(env)
+    if self.initialized:
+      raise RuntimeError(f"{self.name}.initialize_task() is already called.")
+    self.initialized = True
+    seed = self.params.get("seed")
+    if seed is not None:
+      random.seed(seed)
+    adb_utils.launch_app('simple calendar pro', env.controller)
+
+  def tear_down(self, env: interface.AsyncEnv):
+    adb_utils.close_app('simple calendar pro', env.controller)
+    self.initialized = False
+
+  def is_successful(self, env: interface.AsyncEnv) -> float:
+    self._check_is_initialized()
+    return 1.0
+
+  @classmethod
+  def generate_random_params(cls) -> dict[str, Any]:
+    return {}
+
+
+class SimpleCalendarGymSessionTomorrow(_SimpleCalendarFreeform):
+  complexity = 3.0
+  template = "Add a new event to my calendar for tomorrow, Thursday, April 16. The title should be 'Gym Session' from 7:30 AM to 9:00 AM. Set a reminder for 15 minutes before the start time."
+
+
+class SimpleCalendarFlightFromGmail(_SimpleCalendarFreeform):
+  complexity = 3.5
+  template = "Search my Gmail for the most recent email with the subject 'Flight Confirmation'. Find the departure date and time for my flight to Tokyo. Once you find it, create a corresponding event in Simple Calendar Pro titled 'Flight to Tokyo' at that exact time."
+
+
+class SimpleCalendarMoveProjectMeeting(_SimpleCalendarFreeform):
+  complexity = 3.0
+  template = "Check my calendar for today. If there is an event titled 'Project Meeting' at 3:00 PM, please move it to Friday at the same time because I have a schedule conflict. If no such event exists, do nothing."
+
+
+class SimpleCalendarMuseumVisitFromMaps(_SimpleCalendarFreeform):
+  complexity = 3.5
+  template = "Find the 'National Gallery Singapore' on Google Maps and check its opening hours for Friday. Then, create an event in my calendar on that Friday titled 'Museum Visit' starting at the gallery's opening time and ending 3 hours later."
+
+
+class SimpleCalendarWeekendPlanToMarkor(_SimpleCalendarFreeform):
+  complexity = 3.5
+  template = "Look through all my scheduled events for this coming weekend. Note down the titles and start times. Then, open Markor and create a new file named Weekend_Plan.txt with a list of those events so I can share it with my family."
+
+
+class SimpleCalendarDeepWorkSlot(_SimpleCalendarFreeform):
+  complexity = 3.5
+  template = "I need to find a 2-hour free slot this Friday afternoon between 1:00 PM and 6:00 PM. Check my calendar for any existing appointments during that time, and if you find a gap of at least 2 hours, create an event there titled 'Deep Work Session'."
+
+
+class SimpleCalendarACLMainConferenceOnly(_SimpleCalendarFreeform):
+  complexity = 4.0
+  template = "I plan to attend the ACL conference, so create a new calendar event for those main-conference days. Do not include the dates for workshops or tutorials in the event duration."

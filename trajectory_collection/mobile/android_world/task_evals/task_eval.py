@@ -15,6 +15,7 @@
 """Interface for a task and the evaluation logic for that task."""
 
 import abc
+import os
 import random
 from typing import Any
 
@@ -136,6 +137,14 @@ class TaskEval(abc.ABC):
 
   def initialize_device_time(self, env: interface.AsyncEnv) -> None:
     """Initializes the device time."""
+    # Controlled by run.py via ANDROID_WORLD_FREEZE_DATETIME.
+    if os.environ.get('ANDROID_WORLD_FREEZE_DATETIME', '1').lower() in (
+        '0',
+        'false',
+        'no',
+        'off',
+    ):
+      return
     datetime_utils.setup_datetime(env.controller)
     datetime_utils.set_datetime(env.controller, self.device_time)
 

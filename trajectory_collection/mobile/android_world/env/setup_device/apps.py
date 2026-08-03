@@ -225,6 +225,30 @@ class FilesApp(AppSetup):
   app_name = "files"
 
 
+class GoogleMapsApp(AppSetup):
+  """Class for setting up pre-installed Google Maps app."""
+
+  app_name = "google maps"
+
+  @classmethod
+  def setup(cls, env: interface.AsyncEnv) -> None:
+    super().setup(env)
+
+    package = adb_utils.extract_package_name(
+        adb_utils.get_adb_activity(cls.app_name)
+    )
+    adb_utils.grant_permissions(
+        package, "android.permission.ACCESS_FINE_LOCATION", env.controller
+    )
+    adb_utils.grant_permissions(
+        package, "android.permission.ACCESS_COARSE_LOCATION", env.controller
+    )
+
+    adb_utils.launch_app(cls.app_name, env.controller)
+    time.sleep(3.0)
+    adb_utils.close_app(cls.app_name, env.controller)
+
+
 class SettingsApp(AppSetup):
   """Class for setting up pre-installed Settings app."""
 
@@ -703,4 +727,44 @@ class RetroMusicApp(AppSetup):
 
     adb_utils.launch_app(cls.app_name, env.controller)
     time.sleep(2.0)
+    adb_utils.close_app(cls.app_name, env.controller)
+
+
+class YouTubeApp(AppSetup):
+  """Class for setting up pre-installed YouTube app."""
+
+  app_name = "youtube"
+
+  @classmethod
+  def setup(cls, env: interface.AsyncEnv) -> None:
+    super().setup(env)
+    adb_utils.launch_app(cls.app_name, env.controller)
+    time.sleep(3.0)
+    adb_utils.close_app(cls.app_name, env.controller)
+
+
+class GmailApp(AppSetup):
+  """Class for setting up pre-installed Gmail app."""
+
+  app_name = "gmail"
+
+  @classmethod
+  def setup(cls, env: interface.AsyncEnv) -> None:
+    super().setup(env)
+    adb_utils.launch_app(cls.app_name, env.controller)
+    time.sleep(3.0)
+    adb_utils.close_app(cls.app_name, env.controller)
+
+
+class YahooFinanceApp(AppSetup):
+  """Class for setting up Yahoo Finance app."""
+
+  apk_names = ("com.yahoo.mobile.client.android.finance.apk",)
+  app_name = "yahoo finance"
+
+  @classmethod
+  def setup(cls, env: interface.AsyncEnv) -> None:
+    super().setup(env)
+    adb_utils.launch_app(cls.app_name, env.controller)
+    time.sleep(3.0)
     adb_utils.close_app(cls.app_name, env.controller)

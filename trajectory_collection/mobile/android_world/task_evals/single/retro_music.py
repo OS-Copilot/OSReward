@@ -402,3 +402,58 @@ def _generate_playlist_name() -> str:
 
   theme = random.choice(themes)
   return f'{theme} {identifier}'
+
+
+class _RetroMusicFreeform(task_eval.TaskEval):
+  """Base class for freeform Retro Music tasks."""
+
+  app_names = ('retro music',)
+  schema = {'type': 'object', 'properties': {}}
+
+  def initialize_task(self, env: interface.AsyncEnv):
+    env.interaction_cache = ""
+    self.initialize_device_time(env)
+    if self.initialized:
+      raise RuntimeError(f"{self.name}.initialize_task() is already called.")
+    self.initialized = True
+    seed = self.params.get("seed")
+    if seed is not None:
+      random.seed(seed)
+    adb_utils.launch_app('retro music', env.controller)
+
+  def tear_down(self, env: interface.AsyncEnv):
+    adb_utils.close_app('retro music', env.controller)
+    self.initialized = False
+
+  def is_successful(self, env: interface.AsyncEnv) -> float:
+    self._check_is_initialized()
+    return 1.0
+
+  @classmethod
+  def generate_random_params(cls) -> dict[str, Any]:
+    return {}
+
+
+class RetroRepeatCityOfStars(_RetroMusicFreeform):
+  complexity = 3.0
+  template = "Search for the song 'City of Stars' in Retro Music. Once you find it, start playing the song and navigate to the 'Now Playing' screen. From there, locate and enable the 'Repeat One' mode so this specific song loops continuously."
+
+
+class RetroMorningVibePlaylist(_RetroMusicFreeform):
+  complexity = 3.0
+  template = "Open the 'Songs' section in Retro Music. Scroll through the list to find any three songs that start with the letter 'A'. Create a new playlist named 'Morning Vibe' and add these three specific songs to it."
+
+
+class RetroFavoritesToMarkor(_RetroMusicFreeform):
+  complexity = 3.0
+  template = "In Retro Music, go to the 'Playlists' section and open the one named 'Favorites'. Note the titles of the first three songs in this list. Then, switch to Markor, create a new file named My_Top_Songs.txt, and list the three song titles you just found."
+
+
+class RetroRecentSongSms(_RetroMusicFreeform):
+  complexity = 3.0
+  template = "Open Retro Music and start playing any random song from the 'Recently Added' list. Note down the title of the song and the name of the artist. Then, open the Simple SMS Messenger app, start a new message to 'Hannah dos Santos' at '+16715211690', and send a text saying: 'Hey, I am currently listening to [Song Title] by [Artist Name].'"
+
+
+class RetroJustBlackTheme(_RetroMusicFreeform):
+  complexity = 3.0
+  template = "I want to change the look of my music player to save battery on this Wednesday night. Open Retro Music, navigate to 'Settings', and find the 'Theme' or 'Look and Feel' section. Change the App Theme to 'Just Black'."

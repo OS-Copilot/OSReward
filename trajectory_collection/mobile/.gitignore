@@ -2,6 +2,9 @@
 runs/
 api_logs/
 
+# Live credentials (copy of .env.example)
+.env
+
 __pycache__/
 *.pyc
 *.egg-info/

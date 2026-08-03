@@ -45,6 +45,8 @@ _APPS = (
     apps.DialerApp,
     apps.ExpenseApp,
     apps.FilesApp,
+    apps.GmailApp,
+    apps.GoogleMapsApp,
     apps.MarkorApp,
     apps.OpenTracksApp,
     apps.OsmAndApp,
@@ -57,6 +59,8 @@ _APPS = (
     apps.SimpleSMSMessengerApp,
     apps.TasksApp,
     apps.VlcApp,
+    apps.YahooFinanceApp,
+    apps.YouTubeApp,
     # keep-sorted end
 )
 

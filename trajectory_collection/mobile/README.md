@@ -1,9 +1,11 @@
 # Mobile (Android) Trajectory Collection
 
 AndroidWorld-based pipeline for collecting agent trajectories on a live
-Android emulator. An LLM agent (T3A / M3A) runs tasks step by step; every
-step's screenshot, accessibility tree, prompt, and raw model response are
-persisted, then converted into the unified OSReward trajectory schema.
+Android emulator. A screenshot-only tool-call agent
+(`android_world/agents/seeact.py:ToolCallAgent`) runs tasks step by step
+against any OpenAI-compatible model endpoint; every step's screenshot, raw
+model response, and parsed action are persisted, then converted into the
+unified OSReward trajectory schema.
 
 Pipeline stages:
 
@@ -31,7 +33,13 @@ Pipeline stages:
    pip install -r requirements.txt
    ```
 
-3. **First run only:** pass `--perform_emulator_setup` to install the task
+3. **Model endpoint.** Copy `.env.example` to `.env` and fill in
+   `MODEL_NAME` / `MODEL_BASE_URL` / `MODEL_API_KEY`. The model must be listed
+   in `android_world/agents/model_profiles.py` (currently the qwen3-vl and
+   gemini-3 families), or pass `--model_profile qwen3vl|gemini3` to force a
+   prompt format.
+
+4. **First run only:** pass `--perform_emulator_setup` to install the task
    apps and grant permissions (takes several minutes). Note that on every
    launch android_env downloads the accessibility-forwarder APK from
    `storage.googleapis.com`; a flaky connection to it fails the launch, so
@@ -39,86 +47,94 @@ Pipeline stages:
 
 ## Collect
 
-The default agent is `t3a_claude4` (`Claude4WrapperV2`), which speaks the
-OpenAI chat-completion protocol to whatever endpoint `ANTHROPIC_BASE_URL`
-points at (the official API or any OpenAI-compatible gateway):
-
 ```bash
-export ANTHROPIC_API_KEY=<key>
-export ANTHROPIC_BASE_URL=<https://gateway/ or https://api.anthropic.com/>
-
 python run.py \
-  --agent_name=t3a_claude4 \
-  --model_name=claude-sonnet-4-5-20250929 \
+  --agent_name=toolcall \
   --tasks=ClockTimerEntryFiveMinutes,ExpenseAddBackdated \
   --checkpoint_dir=runs/demo
 ```
 
-- `--model_name` overrides the agent's default model id.
-- `--tasks` selects task templates; omit to run the whole registry.
+- The agent, model, and endpoint come from `.env` (or the `--model_name`,
+  `--model_base_url`, `--model_api_key` flags).
+- `--tasks` selects task templates; omit to run the whole active suite.
+- `EXT_SUITE=aw|new_app` (env var) switches which task set the registry
+  serves; see [Tasks](#tasks).
 - `--n_task_combinations=N` collects N random instances per template.
+- `--freeze_datetime` pins the device clock to the AndroidWorld benchmark
+  time (October 2023); leave it off for the live-web `new_app` tasks.
 - Re-running with the same `--checkpoint_dir` resumes and skips finished
   episodes.
-- GPT-family agents (`t3a_gpt4`, `m3a_gpt4v`) read `OPENAI_API_KEY` and
-  `OPENAI_BASE_URL` instead.
 
-Each API call is appended to `api_logs/api_calls.jsonl` (latency + token
-usage, no payloads).
+Each API call is logged locally under `api_logs/` (latency + token usage) by
+`android_world/api/local_api_logger`.
 
 ## Extract, reformat, annotate
 
 ```bash
 python extract_episodes.py --run_dir runs/demo --out_dir runs/demo_extracted
-python reformat.py --root runs/demo_extracted --out_root runs/demo_reformatted \
-  --model_name claude-sonnet-4-5-20250929
+python reformat.py --root runs/demo_extracted --out_root runs/demo_reformatted
 python annotate_binary_reward.py --root runs/demo_reformatted [--dry_run]
 ```
 
 - `extract_episodes.py` decodes each checkpoint into
-  `<task>_<instance>/<task>_<instance>_<step:04d>.png` plus a JSON with the
-  full episode record (a11y element lists, prompts, raw responses,
-  `is_successful` from the task's own validator).
+  `<task>_<instance>_<timestamp>/` with per-step PNGs plus a JSON holding the
+  full episode record (raw responses, parsed actions, step history, and
+  `is_successful` from the task's validator).
 - `reformat.py` converts that into the unified schema: per-step
-  `state.screenshot_path` / `state.a11y_tree`, the parsed `action`
-  (click coordinates resolved from the a11y bbox), `thought`, `raw_response`,
-  plus episode-level `orm_label` / `prm_label` placeholders.
+  `state.screenshot_path`, the parsed `action` (pixel coordinates), the
+  model's `<thinking>` / `<conclusion>` as `thought`, plus episode-level
+  `orm_label` (validator verdict in `score`, manual label slot in
+  `binary_reward`).
 - `annotate_binary_reward.py` writes manually verified 0/1 rewards into
   `orm_label.binary_reward` from its built-in per-task table; tasks not in
   the table are skipped.
 
 ## Tasks
 
-The registry contains only the OSReward extension templates
-(`android_world/task_evals/single/extensions/`, 148 registered) across Clock,
-Calendar, Expense, Markor, Recipe, and Retro Music. Extension tasks come in
-two generations: `extensions_<app>.py` subclass stock tasks with new
-instructions; `extensions_<app>2.py` subclass validator-bearing base classes,
-so `is_successful` is scored automatically. A few templates with broken
-parameter generation are excluded in `registry.py` (see the comments there).
+The registry serves only the OSReward extension tasks
+(`--suite_family=android_world_extension`, the default and only family). Two
+task sets, selected with `EXT_SUITE`:
 
-The stock AndroidWorld task classes for those six apps stay in the tree
-solely as base classes; they are not registered. The unrelated AndroidWorld
-task families (the other single-app tasks, MiniWoB, information retrieval,
-composite) are removed.
+- **`aw`** (default): 131 verified extension tasks over the AndroidWorld apps
+  (Clock, Calendar, Expense, Markor, Recipe, Retro Music), defined in
+  `android_world/task_evals/single/extensions/`. These inherit real
+  `is_successful` validators.
+- **`new_app`**: 115 tasks over newly added apps (Chrome, Gmail, Google Maps,
+  YouTube, Yahoo Finance) plus cross-app flows, defined in
+  `android_world/task_evals/single/{chrome,gmail,google_maps,youtube,yahoo_finance}.py`
+  and freeform additions in the calendar/expense/retro_music modules. Most of
+  their validators are placeholders (`is_successful` returns 1.0): the value
+  of these trajectories is the recorded process, and rewards should come from
+  the annotate stage or a judge.
+
+`SettingsGoogleAppNotificationsAndData`
+(`extensions/extensions_settings.py`) is registered in both sets; its
+validator reads the notification-channel importance and background-data
+policy over adb. The stock AndroidWorld task classes for the six base apps
+stay in the tree solely as base classes; the unrelated AndroidWorld task
+families (other single-app tasks, MiniWoB, information retrieval, composite)
+are removed.
 
 ## Provenance
 
-Vendored from [google-research/android_world](https://github.com/google-research/android_world)
-at upstream commit `c71a6b5` (2025-11-24). Local modifications:
+Vendored from the internal `android_world-publication-cleanup` branch of the
+AndroidWorld fork (upstream base:
+[google-research/android_world](https://github.com/google-research/android_world)
+@ `c71a6b5`). Local modifications on top of that branch:
 
-- `registry.py`: registers only the extension tasks; unrelated task families
-  (MiniWoB, information retrieval, composite, unused single-app tasks) are
-  deleted from the tree, which also drops the protobuf build dependency.
-- `agents/infer.py`: `OPENAI_BASE_URL` support for `Gpt4Wrapper`;
-  `Claude4WrapperV1` (Anthropic Messages REST) and `Claude4WrapperV2`
-  (OpenAI-protocol via `android_world/api/llm_api_utils.py`, records an
-  Anthropic-shaped `raw_response` in trajectories).
-- `task_evals/single/extensions/`: the custom task templates.
-- `run.py`: `t3a_claude4` / `m3a_claude4` agents, `--model_name` flag,
-  output defaults to `runs/`.
-- Top-level `extract_episodes.py`, `reformat.py`, `annotate_binary_reward.py`.
-- Removed upstream parts not needed for collection: `assets/` (demo media),
-  `apps/` (Bazel sources for the companion APKs; prebuilt APKs are installed
-  during emulator setup), and the Docker emulator stack (`Dockerfile`,
-  `docker_setup/`, `server/`, `scripts/`). For those setups see the upstream
-  [android_world](https://github.com/google-research/android_world) repo.
+- Only the tool-call collection agent is kept; the upstream agents (M3A, T3A,
+  SeeAct, human/random) and their wrappers are removed, along with the
+  MiniWoB / information-retrieval / composite task families (this also drops
+  the protobuf build dependency).
+- `registry.py` registers only the extension suites; `EXT_SUITE` is
+  env-configurable.
+- `api/llm_api_utils.py` trimmed to the OpenAI-compatible path used by the
+  agent; API keys are no longer written to local logs.
+- `utils/file_utils.py` restored to upstream's concurrency-safe per-call temp
+  directories.
+- `pysqlite3` made an optional dependency (falls back to stdlib `sqlite3`).
+- Top-level `extract_episodes.py` (renamed from `read_pkl.py`),
+  `reformat.py`, `annotate_binary_reward.py`.
+- Removed upstream parts not needed for collection: `assets/`, `apps/`, the
+  Docker emulator stack (`Dockerfile`, `docker_setup/`, `server/`,
+  `scripts/`), and docs. For those see the upstream repo.

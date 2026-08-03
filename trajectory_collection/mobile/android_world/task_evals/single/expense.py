@@ -18,6 +18,7 @@ import abc
 import dataclasses
 import random
 from typing import Any, Optional
+from android_world.env import adb_utils
 from android_world.env import device_constants
 from android_world.env import interface
 from android_world.env.setup_device import apps
@@ -244,6 +245,67 @@ def _get_expense_rows_as_text(
       'name',
       wrap_width=wrap_width,
   )
+
+
+class _ExpenseFreeform(_Expense):
+  """Base class for freeform expense tasks."""
+
+  schema = {'type': 'object', 'properties': {}}
+
+  def initialize_task(self, env: interface.AsyncEnv):
+    if not sqlite_utils.table_exists(self.table_name, self.db_path, env):
+      apps.ExpenseApp.setup(env)
+    env.interaction_cache = ""
+    self.initialize_device_time(env)
+    if self.initialized:
+      raise RuntimeError(f"{self.name}.initialize_task() is already called.")
+    self.initialized = True
+    seed = self.params.get("seed")
+    if seed is not None:
+      random.seed(seed)
+    adb_utils.launch_app(_APP_NAME, env.controller)
+
+  def tear_down(self, env: interface.AsyncEnv):
+    adb_utils.close_app(_APP_NAME, env.controller)
+    self.initialized = False
+
+  def is_successful(self, env: interface.AsyncEnv) -> float:
+    self._check_is_initialized()
+    return 1.0
+
+  @classmethod
+  def generate_random_params(cls) -> dict[str, Any]:
+    return {}
+
+
+class ExpenseAddChickenRice(_ExpenseFreeform):
+  complexity = 3.0
+  template = "Add a new expense for today, Wednesday, April 15. The amount is $12.50, set the category to 'Food & Drink', and add a note saying 'Chicken Rice at Maxwell Food Centre'."
+
+
+class ExpenseLogBankSmsSocial(_ExpenseFreeform):
+  complexity = 3.0
+  template = "Open the Simple SMS Messenger app and find the latest message from 'DBS Bank' or 'UOB'. Extract the transaction amount and the merchant name mentioned in the text. Then, open Pro Expense and log this as a new expense in the 'Social' category."
+
+
+class ExpenseDailySpendToMarkor(_ExpenseFreeform):
+  complexity = 3.0
+  template = "In Pro Expense, calculate the total sum of all expenses recorded for today. Then, switch to Markor, create a new file named Daily_Spend.txt, and write: 'Total expenditure for today in Singapore: [Total Amount]'."
+
+
+class ExpenseBudgetReviewAlarm(_ExpenseFreeform):
+  complexity = 4.5
+  template = "Check the total spending for this month so far in Pro Expense. If the total is already above $2,000, set an alarm in the Clock app for tomorrow at 8:00 AM with the label 'Budget Review'. If it is below $2,000, you don't need to do anything."
+
+
+class ExpenseUsdToSgdEntertainment(_ExpenseFreeform):
+  complexity = 4.5
+  template = "I just bought something online for $85 USD. First, use Chrome to find the current exchange rate from USD to SGD. Then, use the Calculator to find the equivalent amount in Singapore Dollars. Finally, log that SGD amount in Pro Expense under the 'Entertainment' category with the note 'Online Game Store'."
+
+
+class ExpenseNetflixReviewTask(_ExpenseFreeform):
+  complexity = 3.5
+  template = "Search my history in Pro Expense for any transaction containing the word 'Netflix' from last month. Note the exact amount that was paid. Then, open the Tasks app and create a new task for May 1, 2026, titled 'Review Netflix Subscription' and in the task description, write: 'Last month we paid [Amount]'."
 
 
 class _ExpenseAddMultiple(_Expense, sqlite_validators.AddMultipleRows):

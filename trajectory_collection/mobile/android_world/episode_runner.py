@@ -21,6 +21,8 @@ from android_world.agents import base_agent
 from android_world.env import interface
 import termcolor
 
+# Per-step timeout (seconds). If agent.step() hangs longer than this, the step
+
 
 @dataclasses.dataclass()
 class EpisodeResult:

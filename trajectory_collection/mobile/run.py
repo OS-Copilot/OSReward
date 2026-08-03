@@ -30,12 +30,8 @@ from android_world import checkpointer as checkpointer_lib
 from android_world import registry
 from android_world import suite_utils
 from android_world.agents import base_agent
-from android_world.agents import human_agent
-from android_world.agents import infer
-from android_world.agents import m3a
-from android_world.agents import random_agent
+from android_world.agents import model_profiles
 from android_world.agents import seeact
-from android_world.agents import t3a
 from android_world.env import env_launcher
 from android_world.env import interface
 
@@ -45,20 +41,53 @@ os.environ['GRPC_VERBOSITY'] = 'ERROR'  # Only show errors
 os.environ['GRPC_TRACE'] = 'none'  # Disable tracing
 
 
+def _load_dotenv_if_present(dotenv_path: str = '.env') -> None:
+  """Loads KEY=VALUE pairs from a local .env file into environment variables."""
+  if not os.path.isfile(dotenv_path):
+    return
+  with open(dotenv_path, 'r', encoding='utf-8') as f:
+    for raw_line in f:
+      line = raw_line.strip()
+      if not line or line.startswith('#') or '=' not in line:
+        continue
+      key, value = line.split('=', 1)
+      key = key.strip()
+      value = value.strip()
+      if (
+          len(value) >= 2
+          and value[0] == value[-1]
+          and value[0] in {'"', "'"}
+      ):
+        value = value[1:-1]
+      # Keep real process env as highest priority.
+      os.environ.setdefault(key, value)
+
+
+_load_dotenv_if_present()
+
+
 def _find_adb_directory() -> str:
   """Returns the directory where adb is located."""
   potential_paths = [
       os.path.expanduser('~/Library/Android/sdk/platform-tools/adb'),
       os.path.expanduser('~/Android/Sdk/platform-tools/adb'),
   ]
+  # Windows: ANDROID_HOME or default SDK location
+  android_home = os.environ.get(
+      'ANDROID_HOME') or os.environ.get('ANDROID_SDK_ROOT')
+  if android_home:
+      potential_paths.append(os.path.join(
+          android_home, 'platform-tools', 'adb.exe'))
+      potential_paths.append(os.path.join(
+          android_home, 'platform-tools', 'adb'))
+  localappdata = os.environ.get('LOCALAPPDATA')
+  if localappdata:
+      potential_paths.append(os.path.join(
+          localappdata, 'Android', 'Sdk', 'platform-tools', 'adb.exe'))
   for path in potential_paths:
-    if os.path.isfile(path):
-      return path
-  raise EnvironmentError(
-      'adb not found in the common Android SDK paths. Please install Android'
-      " SDK and ensure adb is in one of the expected directories. If it's"
-      ' already installed, point to the installed location.'
-  )
+      if path and os.path.isfile(path):
+          return path
+  return ''
 
 
 _ADB_PATH = flags.DEFINE_string(
@@ -81,13 +110,18 @@ _DEVICE_CONSOLE_PORT = flags.DEFINE_integer(
     ' first connected device is port 5554, the second is 5556, and'
     ' so on.',
 )
+_FREEZE_DATETIME = flags.DEFINE_boolean(
+    'freeze_datetime',
+    False,
+    'Whether to freeze the emulator datetime for reproducibility. Set False to'
+    ' keep real device time during task execution.',
+)
 
 _SUITE_FAMILY = flags.DEFINE_enum(
     'suite_family',
-    registry.TaskRegistry.ANDROID_WORLD_FAMILY,
+    registry.TaskRegistry.ANDROID_WORLD_EXT_FAMILY,
     [
-        registry.TaskRegistry.ANDROID_WORLD_FAMILY,
-        registry.TaskRegistry.ANDROID_FAMILY,
+        registry.TaskRegistry.ANDROID_WORLD_EXT_FAMILY,
     ],
     'Suite family to run. See registry.py for more information.',
 )
@@ -123,13 +157,44 @@ _OUTPUT_PATH = flags.DEFINE_string(
 )
 
 # Agent specific.
-_AGENT_NAME = flags.DEFINE_string('agent_name', 'm3a_gpt4v', help='Agent name.')
+_AGENT_NAME = flags.DEFINE_string(
+    'agent_name', os.environ.get('AGENT_NAME', 'toolcall'), help='Agent name.'
+)
 
+# Tool-call agent, against any OpenAI-compatible server.
+_MODEL_BASE_URL = flags.DEFINE_string(
+    'model_base_url',
+    os.environ.get(
+        'MODEL_BASE_URL',
+        os.environ.get('QWEN3VL_MODEL_BASE_URL', 'http://127.0.0.1:8000/v1'),
+    ),
+    'OpenAI-compatible base_url, e.g. http://host:port/v1',
+)
+_MODEL_API_KEY = flags.DEFINE_string(
+    'model_api_key',
+    os.environ.get(
+        'MODEL_API_KEY', os.environ.get('QWEN3VL_MODEL_API_KEY', 'EMPTY')
+    ),
+    'API key for the OpenAI-compatible server (if needed).',
+)
 _MODEL_NAME = flags.DEFINE_string(
     'model_name',
-    None,
-    'Overrides the default model id of the selected agent.',
+    os.environ.get('MODEL_NAME', os.environ.get('QWEN3VL_MODEL_NAME', '')),
+    'Model id passed to /v1/chat/completions. Must be listed in'
+    ' android_world/agents/model_profiles.py, or paired with --model_profile.',
 )
+_MODEL_PROFILE = flags.DEFINE_string(
+    'model_profile',
+    os.environ.get('MODEL_PROFILE', ''),
+    'Force a prompt format for a model not listed in model_profiles.py.'
+    " One of: 'qwen3vl', 'gemini3'. Normally left unset.",
+)
+
+# Deprecated aliases, kept so existing .env files and launch configs keep
+# working. Prefer the --model_* flags above.
+flags.DEFINE_alias('qwen3vl_model_base_url', 'model_base_url')
+flags.DEFINE_alias('qwen3vl_model_api_key', 'model_api_key')
+flags.DEFINE_alias('qwen3vl_model_name', 'model_name')
 
 _FIXED_TASK_SEED = flags.DEFINE_boolean(
     'fixed_task_seed',
@@ -146,57 +211,42 @@ def _get_agent(
 ) -> base_agent.EnvironmentInteractingAgent:
   """Gets agent."""
   print('Initializing agent...')
-  agent = None
-  if _AGENT_NAME.value == 'human_agent':
-    agent = human_agent.HumanAgent(env)
-  elif _AGENT_NAME.value == 'random_agent':
-    agent = random_agent.RandomAgent(env)
-  # Gemini.
-  elif _AGENT_NAME.value == 'm3a_gemini_gcp':
-    agent = m3a.M3A(
-        env, infer.GeminiGcpWrapper(model_name='gemini-1.5-pro-latest')
-    )
-  elif _AGENT_NAME.value == 't3a_gemini_gcp':
-    agent = t3a.T3A(
-        env, infer.GeminiGcpWrapper(model_name='gemini-1.5-pro-latest')
-    )
-  # GPT.
-  elif _AGENT_NAME.value == 't3a_gpt4':
-    agent = t3a.T3A(env, infer.Gpt4Wrapper('gpt-4-turbo-2024-04-09'))
-  elif _AGENT_NAME.value == 'm3a_gpt4v':
-    agent = m3a.M3A(env, infer.Gpt4Wrapper('gpt-4-turbo-2024-04-09'))
-  # Claude
-  elif _AGENT_NAME.value == 't3a_claude4':
-    agent = t3a.T3A(
+  # Model-agnostic tool-call agent. 'qwen3vl' is the historical name.
+  if _AGENT_NAME.value in ('toolcall', 'qwen3vl'):
+    agent = seeact.ToolCallAgent(
         env,
-        infer.Claude4WrapperV2(
-            _MODEL_NAME.value or 'claude-sonnet-4-5-20250929'
-        ),
+        model_base_url=_MODEL_BASE_URL.value,
+        model_api_key=_MODEL_API_KEY.value,
+        model_name=_MODEL_NAME.value,
+        model_profile=_MODEL_PROFILE.value,
     )
-  elif _AGENT_NAME.value == 'm3a_claude4':
-    agent = m3a.M3A(
-        env,
-        infer.Claude4WrapperV2(
-            _MODEL_NAME.value or 'claude-sonnet-4-5-20250929'
-        ),
-    )
-  # SeeAct.
-  elif _AGENT_NAME.value == 'seeact':
-    agent = seeact.SeeAct(env)
-
-  if not agent:
+  else:
     raise ValueError(f'Unknown agent: {_AGENT_NAME.value}')
 
-  agent.name = _AGENT_NAME.value
+  # Label results by the model actually evaluated, not by the agent wrapper.
+  if _MODEL_NAME.value:
+    agent.name = _MODEL_NAME.value
+  else:
+    agent.name = _AGENT_NAME.value
 
   return agent
 
 
 def _main() -> None:
   """Runs eval suite and gets rewards back."""
+  # Resolve the model profile up front so an unknown model fails here, rather
+  # than after the emulator has been booted and the suite instantiated.
+  if _AGENT_NAME.value in ('toolcall', 'qwen3vl'):
+    model_profiles.resolve(_MODEL_NAME.value, _MODEL_PROFILE.value)
+
+  # Share datetime policy with task initialization logic.
+  os.environ['ANDROID_WORLD_FREEZE_DATETIME'] = (
+      '1' if _FREEZE_DATETIME.value else '0'
+  )
   env = env_launcher.load_and_setup_env(
       console_port=_DEVICE_CONSOLE_PORT.value,
       emulator_setup=_EMULATOR_SETUP.value,
+      freeze_datetime=_FREEZE_DATETIME.value,
       adb_path=_ADB_PATH.value,
   )
 

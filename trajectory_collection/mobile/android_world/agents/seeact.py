@@ -12,236 +12,324 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SeeAct agent for Android."""
+"""Screenshot-only tool-call agent for Android trajectory collection."""
 
 from typing import Any
+from collections import deque
+import json
+import re
+import time
+
+import numpy as np
+from openai import OpenAI
 
 from android_world.agents import base_agent
-from android_world.agents import seeact_utils
-from android_world.env import actuation
+from android_world.agents import model_profiles
 from android_world.env import interface
 from android_world.env import json_action
+from android_world.api.llm_api_utils import get_model_response
 
-SEEACT_ONLINE_SYS_PROMPT = """Imagine that you are imitating humans operating an Android device for a task step by step. At each stage, you can see the Android screen like humans by a screenshot and know the previous actions before the current step decided by yourself through recorded history. You need to decide on the first following action to take. You can tap on an element, long-press an element, swipe, input text, open an app, or use the keyboard enter, home, or back key. (For your understanding, they are like `adb shell input tap`, `adb shell input swipe`, `adb shell input text`, `adb shell am start -n`, and `adb shell input keyevent`). One next step means one operation within these actions. Unlike humans, for typing (e.g., in text areas, text boxes), you should try directly typing the input or selecting the choice, bypassing the need for an initial click. You should not attempt to create accounts, log in or do the final submission. Terminate when you deem the task complete or if it requires potentially harmful actions."""
-
-SEEACT_ONLINE_QUESTION_DESCRIPTION_NEW_EXP4 = """The screenshot below shows the Android screen you see. Follow the following guidance to think step by step before outlining the next action step at the current stage:
-
-(Current Screen Identification)
-Firstly, think about what the current screen is.
-
-(Previous Action Analysis)
-Secondly, combined with the screenshot, analyze each step of the previous action history and their intention one by one. Particularly, pay more attention to the last step, which may be more related to what you should do now as the next step. Specifically, if the last action involved a INPUT TEXT, always evaluate whether it necessitates a confirmation step, because typically a single INPUT TEXT action does not make effect. (often, simply pressing 'Enter', assuming the default element involved in the last action, unless other clear elements are present for operation).
-
-(Screenshot Details Analysis)
-Closely examine the screenshot to check the status of every part of the screen to understand what you can operate with and what has been set or completed. You should closely examine the screenshot details to see what steps have been completed by previous actions even though you are given the textual previous actions. Because the textual history may not clearly and sufficiently record some effects of previous actions, you should closely evaluate the status of every part of the screen to understand what you have done.
-
-(Next Action Based on Android screen and Analysis)
-Then, based on your analysis, in conjunction with human phone operation habits and the logic of app design, decide on the following action. And clearly outline which element on the Android screen users will operate with as the first next target element, its detailed location, and the corresponding operation.
-
-To be successful, it is important to follow the following rules:
-1. You should only issue a valid action given the current observation.
-2. You should only issue one action at a time
-3. For handling the select dropdown elements on a screen, it's not necessary for you to provide completely accurate options right now. The full list of options for these elements will be supplied later."""
+def _reverse_direction(direction: str | None) -> str:
+  return {
+      "up": "down",
+      "down": "up",
+      "left": "right",
+      "right": "left",
+  }.get(direction, "")
 
 
-SEEACT_CHOICE_PROMPT_DICT = {
-    "system_prompt": SEEACT_ONLINE_SYS_PROMPT,
-    "question_description": SEEACT_ONLINE_QUESTION_DESCRIPTION_NEW_EXP4,
-    "referring_description": """(Reiteration)
-First, reiterate your next target element, its detailed location, and the corresponding operation.
-
-(Multichoice Question)
-Below is a multi-choice question, where the choices are elements on the screen. All elements are arranged in the order based on their height on the screen, from top to bottom (and from left to right). This arrangement can be used to locate them. From the screenshot, find out where and what each one is on the screen, taking into account both their text content and details. Then, determine whether one matches your target element. Please examine the choices one by one. Choose the matching one. If multiple options match your answer, choose the most likely one by re-examining the screenshot, the choices, and your further reasoning. If you would like to perform a swipe action, you can optionally select the choice where you will swipe.""",
-    "element_format": """(Final Answer)
-Finally, conclude your answer using the format below. Ensure your answer is strictly adhering to the format provided below. Please do not leave any explanation in your answers of the final standardized format part, and this final part should be clear and certain. The element choice, action, and value should be in three separate lines.
-
-Format:
-
-ELEMENT: The uppercase letter of your choice. (No need for **ACTIONS_WITHOUT_ELEMENT**; and optional for SWIPE.)
-
-ACTION: Choose an action from {**VALID_ACTIONS**}.
-
-VALUE: Provide additional input based on ACTION.
-
-The VALUE means:
-If ACTION == INPUT TEXT, specify the text to be typed.
-If ACTION == SWIPE, specify the direction: up, down, left, right.
-If ACTION == OPEN APP, provide the name of the app to be opened.
-If ACTION == ANSWER, specify the text of your answer to respond directly to a question or request for information.
-For CLICK, LONG PRESS, KEYBOARD ENTER, NAVIGATE HOME, NAVIGATE BACK, WAIT, and TERMINATE, write "None".""".replace(
-        "**ACTIONS_WITHOUT_ELEMENT**",
-        ", ".join(seeact_utils.ACTIONS_WITHOUT_ELEMENT),
-    ).replace(
-        "**VALID_ACTIONS**", ", ".join(seeact_utils.VALID_ACTIONS)
-    ),
-}
+def _dir_from_coords(x0: float, y0: float, x1: float, y1: float) -> str:
+  dx, dy = x1 - x0, y1 - y0
+  if abs(dx) > abs(dy):
+    return "right" if dx > 0 else "left"
+  return "down" if dy > 0 else "up"
 
 
-def generate_seeact_prompts(
-    task: str,
-    previous_actions: list[str] | None = None,
-    ui_element_choices: list[Any] | None = None,
-    additional_guidelines: list[str] | None = None,
-) -> tuple[str, str, str]:
-  """Generates prompts for the SeeAct setup.
-
-  Args:
-      task: Description of the task to be performed.
-      previous_actions: A list of actions previously taken.
-      ui_element_choices: A list of choices available for the next action,
-        derived from the accessibility tree.
-      additional_guidelines: Task specific guidelines.
-
-  Returns:
-      A list of strings forming the complete prompt for the SeeAct task.
-  """
-  system_prompt_input = SEEACT_CHOICE_PROMPT_DICT["system_prompt"]
-  question_description_input = SEEACT_CHOICE_PROMPT_DICT["question_description"]
-  referring_input = SEEACT_CHOICE_PROMPT_DICT["referring_description"]
-  element_format_input = SEEACT_CHOICE_PROMPT_DICT["element_format"]
-
-  if additional_guidelines is not None:
-    for guideline in additional_guidelines:
-      system_prompt_input += f" {guideline}"
-
-  return (
-      system_prompt_input,
-      seeact_utils.generate_action_generation_prompt(
-          task,
-          question_description_input,
-          previous_actions=previous_actions,
-      ),
-      seeact_utils.generate_grounding_prompt(
-          referring_description=referring_input,
-          element_format=element_format_input,
-          ui_element_choices=ui_element_choices,
-      ),
-  )
-
-
-class SeeAct(base_agent.EnvironmentInteractingAgent):
-  """SeeAct agent for Android."""
-
-  def __init__(self, env: interface.AsyncEnv, name: str = "SeeAct"):
-    super().__init__(env, name)
-    self._actions = []
-    self.additional_guidelines = None
-
-  def reset(self, go_home: bool = False) -> None:
-    super().reset(go_home)
-    self.env.hide_automation_ui()
-    self._actions.clear()
-
-  def set_task_guidelines(self, task_guidelines: list[str]) -> None:
-    self.additional_guidelines = task_guidelines
-
-  def step(
-      self, goal: str, verbose: bool = True
-  ) -> base_agent.AgentInteractionResult:
-    result = {
-        "ui_elements": None,
-        "screenshot": None,
-        "actionable_elements": None,
-        "action_gen_payload": None,
-        "action_gen_response": None,
-        "action_ground_payload": None,
-        "action_ground_response": None,
-        "seeact_action": None,
-        "action": None,
-        "action_description": None,
+def qwen3vl_action_transform(
+    action: str,
+    arguments: dict[str, Any],
+    width: int,
+    height: int,
+) -> dict[str, Any]:
+  if action == "key":
+    return {"action_type": "wait"}
+  if action in ("click", "left_click"):
+    coordinate = arguments.get("coordinate", [0, 0])
+    x, y = coordinate
+    return {"action_type": "click", "x": x / 1000 * width, "y": y / 1000 * height}
+  if action == "long_press":
+    coordinate = arguments.get("coordinate", [0, 0])
+    x, y = coordinate
+    return {
+        "action_type": "long_press",
+        "x": x / 1000 * width,
+        "y": y / 1000 * height,
     }
+  if action == "swipe":
+    coordinate = arguments.get("coordinate", [0, 0])
+    coordinate2 = arguments.get("coordinate2", [0, 0])
+    x0, y0 = coordinate[0] / 1000 * width, coordinate[1] / 1000 * height
+    x1, y1 = coordinate2[0] / 1000 * width, coordinate2[1] / 1000 * height
+    direction = _dir_from_coords(x0, y0, x1, y1)
+    return {"action_type": "scroll", "direction": _reverse_direction(direction)}
+  if action == "type":
+    return {"action_type": "input_text", "text": arguments.get("text", "")}
+  if action == "system_button":
+    button = arguments.get("button", "").lower()
+    if button == "home":
+      return {"action_type": "navigate_home"}
+    if button == "back":
+      return {"action_type": "navigate_back"}
+    if button == "enter":
+      return {"action_type": "keyboard_enter"}
+    return {"action_type": "wait"}
+  if action == "open":
+    return {"action_type": "open_app", "app_name": arguments.get("text", "")}
+  if action == "wait":
+    return {"action_type": "wait"}
+  if action == "answer":
+    return {"action_type": "answer", "text": arguments.get("text", "")}
+  if action == "terminate":
+    status = arguments.get("status", "").lower()
+    if status == "success":
+      return {"action_type": "status", "goal_status": "complete"}
+    if status == "failure":
+      return {"action_type": "status", "goal_status": "infeasible"}
+    return {"action_type": "status", "goal_status": "infeasible"}
+  return {"action_type": "wait"}
+
+
+def _parse_tool_call_json(block: str) -> dict[str, Any] | None:
+  m = re.search(r"<tool_call>\s*([\s\S]*?)\s*</tool_call>", block)
+  if not m:
+    return None
+  payload = m.group(1).strip()
+  try:
+    return json.loads(payload)
+  except Exception:
+    return None
+
+
+class ToolCallAgent(base_agent.EnvironmentInteractingAgent):
+  """Model-agnostic Android GUI agent driven by `<tool_call>` JSON output.
+
+  The prompt format and history extraction come from a `ModelProfile`, resolved
+  once from the model name (see `model_profiles.py`), so this class contains no
+  per-model branching.
+  """
+
+  def __init__(
+      self,
+      env: interface.AsyncEnv,
+      name: str = "ToolCallAgent",
+      wait_after_action_seconds: float = 2.0,
+      model_base_url: str = "http://127.0.0.1:8000/v1",
+      model_api_key: str = "EMPTY",
+      model_name: str = "",
+      extra_headers: dict[str, str] | None = None,
+      model_profile: str = "",
+  ):
+    super().__init__(env, name)
+    self.wait_after_action_seconds = wait_after_action_seconds
+    self.model_name = model_name
+    # Raises on an unknown model rather than silently picking a prompt format.
+    self.profile = model_profiles.resolve(model_name, model_profile)
+    self.client = OpenAI(
+        api_key=model_api_key,
+        base_url=model_base_url,
+        default_headers=extra_headers,
+    )
+    self.step_his: str = ""
+    self.turn_number: int = 0
+    self.last_action: str | None = None
+    self.repeat_time: int = 0
+    self.max_retry: int = 3
+    self.temperature: int = 0
+    self.timeout: int = 60
+
+    # Keep the last N screenshots to provide multi-frame context.
+    self.last_N: int = 3
+    self._recent_screenshots: deque[np.ndarray] = deque(maxlen=self.last_N)
+
+  def reset(self, go_home_on_reset: bool = False):
+    super().reset(go_home_on_reset)
+    self.env.hide_automation_ui()
+    self.step_his = ""
+    self.turn_number = 0
+    self.last_action = None
+    self.repeat_time = 0
+    self._recent_screenshots.clear()
+
+  @staticmethod
+  def _to_base64_png(image: np.ndarray) -> str:
+    import base64
+    from io import BytesIO
+    from PIL import Image as PILImage
+
+    buf = BytesIO()
+    PILImage.fromarray(image).save(buf, format="PNG")
+    return f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode()}"
+
+  def step(self, instruction: str) -> base_agent.AgentInteractionResult:
+    self.turn_number += 1
+
     state = self.get_post_transition_state()
-    result["ui_elements"] = state.ui_elements
-    result["screenshot"] = state.pixels
-    actionable_elements = seeact_utils.format_and_filter_elements(
-        state.ui_elements
-    )
-    result["actionable_elements"] = actionable_elements
-    descriptions = [e.description for e in actionable_elements]
-    sys_prompt, action_gen_prompt, action_ground_prompt = (
-        generate_seeact_prompts(
-            task=goal,
-            previous_actions=self._actions,
-            ui_element_choices=descriptions,
-            additional_guidelines=self.additional_guidelines,
-        )
+    screenshot = state.pixels.copy()
+    model_screenshot = screenshot[:, :, ::-1]
+    height, width = model_screenshot.shape[:2]
+
+    # Accumulate recent screenshots for multi-frame context.
+    self._recent_screenshots.append(model_screenshot)
+
+    system_prompt = self.profile.system_prompt
+    user_prompt = self.profile.user_prompt.format(
+        instruction=instruction, history=self.step_his
     )
 
-    # Action generation.
-    payload = seeact_utils.create_action_generation_messages_payload(
-        sys_prompt, action_gen_prompt, state.pixels
-    )
-    result["action_gen_payload"] = payload
-    response = seeact_utils.execute_openai_request(payload)
-    action_gen_response = response["choices"][0]["message"]["content"]
-    result["action_gen_response"] = action_gen_response
-    if verbose:
-      (
-          seeact_utils.display_prompt(
-              result["action_gen_payload"],
-              extra_text="\n~~~ANSWER~~~:" + action_gen_response,
-          )
+    # Build user content with text + last N screenshots.
+    user_content: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
+    for img in list(self._recent_screenshots):
+      user_content.append(
+          {"type": "image_url", "image_url": {"url": self._to_base64_png(img)}}
       )
 
-    # Grounding.
-    payload = seeact_utils.create_grounding_messages_payload(
-        sys_prompt,
-        action_gen_prompt,
-        state.pixels,
-        action_gen_response,
-        action_ground_prompt,
-    )
-    result["action_ground_payload"] = payload
-    response = seeact_utils.execute_openai_request(payload)
-    action_ground_response = response["choices"][0]["message"]["content"]
-    result["action_ground_response"] = action_ground_response
+    messages = [
+        {
+            "role": "system",
+            "content": [{"type": "text", "text": system_prompt}],
+        },
+        {
+            "role": "user",
+            "content": user_content,
+        },
+    ]
 
-    # Parse action and convert to JSONAction.
+    completion = get_model_response(
+          model_url=str(self.client.base_url),
+          model_name=self.model_name,
+          model_token=self.client.api_key,
+          messages=messages,
+          tool_schemas=None,
+          agent_logger=None,
+          max_retry_num=self.max_retry,
+          temperature=self.temperature,
+          timeout=self.timeout
+      )
+    response = completion.content or ""
+
+    print(response)
+    print("=" * 50)
+
+    args = None
+    tool_call = _parse_tool_call_json(response)
+    if not tool_call:
+      return base_agent.AgentInteractionResult(
+          True,
+          {
+              "summary": "No <tool_call> JSON found in model output.",
+              "response": response,
+              "screenshot": screenshot,
+              "step_history": self.step_his,
+              "parsed": None,
+              "tool_call_args": None,
+              "turn_number": self.turn_number,
+              "screen_width": width,
+              "screen_height": height,
+          },
+      )
+
+    op_text = self.profile.extract_history(response)
+    self.step_his += f"Step {self.turn_number}: {op_text}; "
+
+    args = tool_call.get("arguments", {}) if isinstance(tool_call, dict) else {}
+    action_name = args.get("action", "")
     try:
-      action_ground_response = result["action_ground_response"]
-      seeact_action = seeact_utils.extract_element_action_value(
-          action_ground_response.split("\n")
+      parsed = qwen3vl_action_transform(action_name, args, width, height)
+      print(parsed)
+    except Exception as e:
+      return base_agent.AgentInteractionResult(
+          True,
+          {
+              "summary": f"Failed to transform tool-call into action: {e}",
+              "response": response,
+              "tool_call": tool_call,
+              "screenshot": screenshot,
+              "step_history": self.step_his,
+              "parsed": None,
+              "tool_call_args": args,
+              "turn_number": self.turn_number,
+              "screen_width": width,
+              "screen_height": height,
+          },
       )
-      action = seeact_utils.convert_seeact_action_to_json_action(
-          seeact_action, actionable_elements
-      )
-      result["seeact_action"] = seeact_action
-      result["action"] = action
-    except seeact_utils.ParseActionError as e:
-      action_description = f"No Operation with error: {e}"
-      action = json_action.JSONAction(action_type=json_action.UNKNOWN)
-      result["seeact_action"] = None
-      result["action"] = action
+
+    try:
+      action_sig = json.dumps(args, ensure_ascii=False, sort_keys=True)
+    except Exception:
+      action_sig = str(args)
+    if self.last_action == action_sig:
+      self.repeat_time += 1
     else:
-      target_element = seeact_utils.get_referred_element(
-          seeact_action, actionable_elements
-      )
-      action_description = seeact_utils.generate_action_description(
-          seeact_action, target_element
-      )
-      actuation.execute_adb_action(
-          action,
-          [e.ui_element for e in actionable_elements],
-          self.env.logical_screen_size,
-          self.env.controller,
+      self.repeat_time = 0
+    self.last_action = action_sig
+
+    try:
+      act = json_action.JSONAction(**parsed)
+      self.env.execute_action(act)
+      time.sleep(self.wait_after_action_seconds)
+    except Exception:
+      print("Failed to execute action:", parsed)
+
+    if parsed.get("action_type") == "status":
+      return base_agent.AgentInteractionResult(
+          True,
+          {
+              "response": response,
+              "step_history": self.step_his,
+              "parsed": parsed,
+              "screenshot": screenshot,
+              "summary": None,
+              "tool_call_args": args,
+              "turn_number": self.turn_number,
+              "screen_width": width,
+              "screen_height": height,
+          },
       )
 
-    result["action_description"] = action_description
-    self._actions.append(action_description)
-
-    if verbose:
-      print("=" * 80)
-      (
-          seeact_utils.display_prompt(
-              result["action_ground_payload"],
-              extra_text="\n\n~~~~~~~~~ANSWER~~~~~~~~~:"
-              + action_description
-              + "\n\n",
-          )
+    if self.repeat_time >= 10:
+      return base_agent.AgentInteractionResult(
+          True,
+          {
+              "summary": "Terminated due to repeated identical actions.",
+              "response": response,
+              "step_history": self.step_his,
+              "parsed": parsed,
+              "repeat_time": self.repeat_time,
+              "screenshot": screenshot,
+              "tool_call_args": args,
+              "turn_number": self.turn_number,
+              "screen_width": width,
+              "screen_height": height,
+          },
       )
-      print("=" * 80)
 
     return base_agent.AgentInteractionResult(
-        done=action.action_type == json_action.STATUS,
-        data=result,
+        False,
+        {
+            "response": response,
+            "step_history": self.step_his,
+            "parsed": parsed,
+            "screenshot": screenshot,
+            "summary": None,
+            "tool_call_args": args,
+            "turn_number": self.turn_number,
+            "screen_width": width,
+            "screen_height": height,
+        },
     )
+
+
+# Backwards-compatible alias. The agent was originally Qwen3-VL specific; it is
+# now model-agnostic (see `model_profiles.py`), but existing imports and saved
+# run metadata still refer to it by the old name.
+Qwen3VL = ToolCallAgent
