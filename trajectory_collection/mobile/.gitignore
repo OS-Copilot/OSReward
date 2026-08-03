@@ -1,0 +1,8 @@
+# Collected artifacts
+runs/
+api_logs/
+
+__pycache__/
+*.pyc
+*.egg-info/
+.DS_Store
