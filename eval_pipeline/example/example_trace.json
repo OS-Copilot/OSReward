@@ -1,0 +1,53 @@
+{
+  "trace_id": "example_dark_mode_0",
+  "task_id": "SettingsEnableDarkMode_0",
+  "platform": "Desktop",
+  "agent": "example-agent",
+  "instruction": "Turn on Dark Mode in the Settings app.",
+  "trajectory": [
+    {
+      "step_index": 0,
+      "screenshot_path": "screenshots/step_0000.png",
+      "raw_response": null,
+      "thought": "I need to open the Settings app first. I can see its icon on the desktop.",
+      "action": "click(coordinate=[150, 608])",
+      "coordinate": [150, 608],
+      "coordinate2": null,
+      "meta_action": "click"
+    },
+    {
+      "step_index": 1,
+      "screenshot_path": "screenshots/step_0001.png",
+      "raw_response": null,
+      "thought": "The Settings app is open. Dark Mode should be under the Display section.",
+      "action": "click(coordinate=[500, 504])",
+      "coordinate": [500, 504],
+      "coordinate2": null,
+      "meta_action": "click"
+    },
+    {
+      "step_index": 2,
+      "screenshot_path": "screenshots/step_0002.png",
+      "raw_response": null,
+      "thought": "I am on the Display page. The Dark Mode toggle is currently off; I will click it.",
+      "action": "click(coordinate=[860, 448])",
+      "coordinate": [860, 448],
+      "coordinate2": null,
+      "meta_action": "click"
+    },
+    {
+      "step_index": 3,
+      "screenshot_path": "screenshots/step_0003.png",
+      "raw_response": null,
+      "thought": "The interface switched to dark colors and the toggle now shows On. The task is complete.",
+      "action": "terminate(status='success')",
+      "coordinate": null,
+      "coordinate2": null,
+      "meta_action": "terminate"
+    }
+  ],
+  "trajectory_length": 4,
+  "human_label": "SUCCESS",
+  "human_alignment": 1.0,
+  "human_efficiency": 1.0
+}
