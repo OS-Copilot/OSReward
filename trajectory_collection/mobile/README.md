@@ -18,32 +18,51 @@ Pipeline stages:
 
 ## Setup
 
-1. **Android emulator.** Create an AVD named `AndroidWorldAvd` (Pixel 6,
-   Tiramisu API 33 system image) via Android Studio, then launch it from the
-   command line with gRPC enabled:
+> **Windows only.** The emulator image is compiled and packaged on Windows,
+> and the setup script is PowerShell. macOS and Linux are not currently supported.
 
-   ```bash
-   ~/Library/Android/sdk/emulator/emulator -avd AndroidWorldAvd -no-snapshot -grpc 8554
+1. **Emulator image.** Import the prepared snapshot
+
+   Install [Android Studio](https://developer.android.com/studio), then under
+   **Settings → Languages & Frameworks → Android SDK → SDK Tools** enable
+   **Android SDK Command-line Tools**. Then run from this directory:
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File scripts/setup_avd.ps1
    ```
 
-2. **Python environment** (3.11+):
+   It locates the Android Studio bundles and installs the required SDK components
+   (emulator, platform-tools, the `android-33` Google APIs x86_64 system
+   image), downloads the snapshot from
+   [Hugging Face](https://huggingface.co/datasets/Lemaqwq/AndroidWorldAvd), unpacks it into
+   `%USERPROFILE%\.android\avd`, and fills in the local SDK path. Re-running
+   is safe; add `-Force` to redo the download.
 
-   ```bash
+2. **Launch the emulator** from the command line, not the Android Studio UI —
+   the `-grpc 8554` flag is what lets the accessibility forwarder communicate:
+
+   ```powershell
+   & "$env:LOCALAPPDATA\Android\Sdk\emulator\emulator.exe" -avd AndroidWorldAvd -no-snapshot -grpc 8554
+   ```
+
+   Confirm with `adb devices`; the port shown must match `--console_port`
+   (default `5554`). Note that on every launch android_env downloads the
+   accessibility-forwarder APK from `storage.googleapis.com`; a flaky
+   connection to it fails the launch, so just retry.
+
+3. **Python environment** (3.11+):
+
+   ```powershell
    conda create -n android_world python=3.11.8 && conda activate android_world
    pip install -r requirements.txt
    ```
 
-3. **Model endpoint.** Copy `.env.example` to `.env` and fill in
+4. **Model endpoint.** Copy `.env.example` to `.env` and fill in
    `MODEL_NAME` / `MODEL_BASE_URL` / `MODEL_API_KEY`. The model must be listed
    in `android_world/agents/model_profiles.py` (currently the qwen3-vl and
    gemini-3 families), or pass `--model_profile qwen3vl|gemini3` to force a
    prompt format.
 
-4. **First run only:** pass `--perform_emulator_setup` to install the task
-   apps and grant permissions (takes several minutes). Note that on every
-   launch android_env downloads the accessibility-forwarder APK from
-   `storage.googleapis.com`; a flaky connection to it fails the launch, so
-   just retry.
 
 ## Collect
 
