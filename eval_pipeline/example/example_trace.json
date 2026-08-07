@@ -47,7 +47,5 @@
     }
   ],
   "trajectory_length": 4,
-  "human_label": "SUCCESS",
-  "human_alignment": 1.0,
-  "human_efficiency": 1.0
+  "human_label": "SUCCESS"
 }

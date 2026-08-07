@@ -1,36 +1,5 @@
 #!/usr/bin/env python3
-"""
-OSReward standalone judge: evaluate GUI-agent trajectories with a VLM through
-any OpenAI-compatible API.
-
-Two output modes, selected with --prompt_type:
-  binary  ->  Judge: SUCCESS | FAIL                       (OSReward)
-  multi   ->  Judge + Alignment + Efficiency sub-scores   (OSReward-Multi)
-
-Each mode loads its canonical system prompt from prompts/ (binary_v1.txt /
-multi_v4.txt); --prompt_file overrides both.
-
-Usage
------
-  # Multi output (default) on the bundled example trace
-  python run_judge.py --traces example/example_trace.json \
-      --models gpt-4o --base_url https://api.openai.com/v1 --api_key $OPENAI_API_KEY
-
-  # Binary output
-  python run_judge.py --traces example/example_trace.json \
-      --models gpt-4o --prompt_type binary
-
-  # A directory of traces, several judge models, higher concurrency
-  python run_judge.py --traces /path/to/traces_dir --models gpt-4o claude-sonnet-4-6 \
-      --version my_run --max_workers 8
-
-Trace format (one JSON per trajectory; see README.md):
-  {"trace_id": ..., "task_id": ..., "platform": ..., "agent": ...,
-   "instruction": ..., "trajectory": [{"step_index", "screenshot_path",
-   "thought", "action", "coordinate"}, ...]}
-Optional gold fields "human_label" / "human_alignment" / "human_efficiency"
-enable accuracy scoring in the final report.
-"""
+"""Run a binary OSReward judge through OpenAI or Anthropic API protocols."""
 
 from __future__ import annotations
 
@@ -48,19 +17,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
+from anthropic import Anthropic
 from openai import OpenAI
 from PIL import Image, ImageDraw
 from tqdm import tqdm
 
+
 logger = logging.getLogger(__name__)
-
-# ── Defaults ────────────────────────────────────────────────────────────────
-
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_PROMPT_FILES = {
-    "multi":  SCRIPT_DIR / "prompts" / "multi_v4.txt",
-    "binary": SCRIPT_DIR / "prompts" / "binary_v1.txt",
-}
+DEFAULT_PROMPT_FILE = SCRIPT_DIR / "prompts" / "binary_v1.txt"
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "results"
 DEFAULT_FIRST_N = 0
 DEFAULT_LAST_N = 5
@@ -68,83 +33,72 @@ DEFAULT_TIMEOUT = 120
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_MAX_WORKERS = 4
 ALL_STEPS = 2**31
+PARSE_RETRIES = 1
 
-SUBSCORE_LEVELS = (0.0, 0.5, 1.0)
 
-
-def _int_or_all(value: str) -> int:
+def int_or_all(value: str) -> int:
     if value.lower() == "all":
         return ALL_STEPS
-    n = int(value)
-    if n < 0:
-        raise argparse.ArgumentTypeError("must be a non-negative integer or 'all'")
-    return n
-
-
-# ── Prompt loading ──────────────────────────────────────────────────────────
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be non-negative or 'all'")
+    return number
 
 
 def load_system_prompt(path: Path) -> tuple[str, str]:
-    """Return (prompt_text, version_tag). version_tag is the filename stem."""
-    if not path.exists():
+    if not path.is_file():
         raise FileNotFoundError(f"Prompt file not found: {path}")
     return path.read_text(encoding="utf-8").strip(), path.stem
 
 
-# ── Trace discovery ─────────────────────────────────────────────────────────
-
-
 def discover_traces(paths: list[Path]) -> list[dict]:
-    """Load trace JSONs from files and/or directories (recursive scan).
-
-    A JSON file counts as a trace when its top-level object is a dict with
-    both "trace_id" and "task_id".
-    """
     json_paths: list[Path] = []
-    for p in paths:
-        if p.is_dir():
-            json_paths.extend(sorted(p.rglob("*.json")))
-        elif p.is_file():
-            json_paths.append(p)
+    for path in paths:
+        if path.is_dir():
+            json_paths.extend(sorted(path.rglob("*.json")))
+        elif path.is_file():
+            json_paths.append(path)
         else:
-            raise FileNotFoundError(f"Trace path not found: {p}")
+            raise FileNotFoundError(f"Trace path not found: {path}")
 
     records: list[dict] = []
     seen: set[str] = set()
-    for jp in json_paths:
-        if jp.name.startswith("."):
+    for json_path in json_paths:
+        if json_path.name.startswith("."):
             continue
         try:
-            with open(jp, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            with json_path.open(encoding="utf-8") as handle:
+                data = json.load(handle)
         except Exception as exc:
-            print(f"  [skip] invalid JSON: {jp} ({exc})")
+            print(f"  [skip] invalid JSON: {json_path} ({exc})")
             continue
-        if not (isinstance(data, dict) and data.get("trace_id") and data.get("task_id")):
+        if not (
+            isinstance(data, dict)
+            and data.get("trace_id")
+            and data.get("task_id")
+            and data.get("human_label") in {"SUCCESS", "FAIL"}
+        ):
             continue
-        tid = str(data["trace_id"])
-        if tid in seen:
-            continue
-        seen.add(tid)
-        records.append({
-            "trace_id": tid,
-            "task_id": str(data["task_id"]),
-            "platform": str(data.get("platform", "")),
-            "agent": str(data.get("agent", "")),
-            "instruction": str(data.get("instruction", "")),
-            "trajectory": data.get("trajectory") or [],
-            "source_json_path": str(jp),
-            "human_label": data.get("human_label"),
-            "human_alignment": data.get("human_alignment"),
-            "human_efficiency": data.get("human_efficiency"),
-        })
-    return sorted(records, key=lambda r: r["trace_id"])
+        trace_id = str(data["trace_id"])
+        if trace_id in seen:
+            raise ValueError(f"Duplicate trace_id in input: {trace_id}")
+        seen.add(trace_id)
+        records.append(
+            {
+                "trace_id": trace_id,
+                "task_id": str(data["task_id"]),
+                "platform": str(data.get("platform", "")),
+                "agent": str(data.get("agent", "")),
+                "instruction": str(data.get("instruction", "")),
+                "trajectory": data.get("trajectory") or [],
+                "source_json_path": str(json_path),
+                "human_label": data["human_label"],
+            }
+        )
+    return sorted(records, key=lambda record: record["trace_id"])
 
 
-# ── Image processing ────────────────────────────────────────────────────────
-
-
-def _is_valid_norm_point(value) -> bool:
+def is_valid_norm_point(value: object) -> bool:
     if not isinstance(value, list) or len(value) != 2:
         return False
     try:
@@ -155,23 +109,25 @@ def _is_valid_norm_point(value) -> bool:
 
 
 def image_to_data_url(image_path: Path, step: dict | None = None) -> str:
-    """Base64-encode a screenshot; if the step has a click coordinate
-    (normalized 0-1000), draw a red circle around the action point."""
     mime_type, _ = mimetypes.guess_type(str(image_path))
-    if step and _is_valid_norm_point(step.get("coordinate")):
-        with Image.open(image_path) as raw_img:
-            img = raw_img.convert("RGB")
-            w, h = img.size
+    if step and is_valid_norm_point(step.get("coordinate")):
+        with Image.open(image_path) as raw_image:
+            image = raw_image.convert("RGB")
+            width, height = image.size
             nx, ny = step["coordinate"]
-            x, y = float(nx) / 1000.0 * w, float(ny) / 1000.0 * h
-            radius = max(10, int(min(w, h) * 0.05))
-            lw = max(4, int(min(w, h) * 0.008))
-            draw = ImageDraw.Draw(img)
-            draw.ellipse([(x - radius, y - radius), (x + radius, y + radius)],
-                         outline="red", width=lw)
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            image_bytes = buf.getvalue()
+            x = float(nx) / 1000.0 * width
+            y = float(ny) / 1000.0 * height
+            radius = max(10, int(min(width, height) * 0.05))
+            line_width = max(4, int(min(width, height) * 0.008))
+            draw = ImageDraw.Draw(image)
+            draw.ellipse(
+                [(x - radius, y - radius), (x + radius, y + radius)],
+                outline="red",
+                width=line_width,
+            )
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG")
+            image_bytes = buffer.getvalue()
         mime_type = "image/png"
     else:
         mime_type = mime_type or "image/png"
@@ -180,76 +136,87 @@ def image_to_data_url(image_path: Path, step: dict | None = None) -> str:
     return f"data:{mime_type};base64,{encoded}"
 
 
-# ── Message building ────────────────────────────────────────────────────────
-
-
-def _norm(value) -> str:
+def norm(value: object) -> str:
     return str(value).strip() if value is not None else ""
 
 
-def build_history_text(trajectory: list[dict], *, include_thought: bool = True) -> str:
+def build_history_text(trajectory: list[dict], include_thought: bool = True) -> str:
     lines: list[str] = []
-    for idx, step in enumerate(trajectory):
-        si = step.get("step_index", idx)
-        action = _norm(step.get("action")) or "[empty]"
+    for position, step in enumerate(trajectory):
+        step_index = step.get("step_index", position)
+        action = norm(step.get("action")) or "[empty]"
         if include_thought:
-            thought = _norm(step.get("thought")) or "[empty]"
-            lines.append(f"Step {si}:\nThought: {thought}\nAction: {action}")
+            thought = norm(step.get("thought")) or "[empty]"
+            lines.append(f"Step {step_index}:\nThought: {thought}\nAction: {action}")
         else:
-            lines.append(f"Step {si}:\nAction: {action}")
+            lines.append(f"Step {step_index}:\nAction: {action}")
     return "\n\n".join(lines)
 
 
 def resolve_screenshots(
-    source_json_path: str, trajectory: list[dict], first_n: int, last_n: int,
-) -> list[dict]:
-    """Select first_n + last_n steps and resolve their screenshot paths
-    (relative to the trace JSON's directory)."""
+    source_json_path: str,
+    trajectory: list[dict],
+    first_n: int,
+    last_n: int,
+) -> tuple[list[dict], int]:
+    """Resolve selected screenshots, skipping explicitly unavailable frames."""
     if not trajectory:
-        return []
+        return [], 0
     total = len(trajectory)
     indices: set[int] = set()
     if first_n > 0:
         indices.update(range(min(first_n, total)))
     if last_n > 0:
         indices.update(range(max(0, total - last_n), total))
-    if not indices:
-        return []
-    selected = [trajectory[i] for i in sorted(indices)]
     json_dir = Path(source_json_path).resolve().parent
     items: list[dict] = []
-    for step in selected:
-        rel = step.get("screenshot_path")
-        if not rel or not isinstance(rel, str):
-            raise ValueError(f"Missing screenshot_path in step {step.get('step_index')}")
-        abs_path = (json_dir / rel).resolve()
-        if not abs_path.exists():
-            raise FileNotFoundError(f"Screenshot not found: {abs_path}")
-        items.append({"image_path": abs_path, "step": step})
-    return items
+    missing = 0
+    for index in sorted(indices):
+        step = trajectory[index]
+        relative_path = step.get("screenshot_path")
+        if not relative_path or not isinstance(relative_path, str):
+            missing += 1
+            continue
+        absolute_path = (json_dir / relative_path).resolve()
+        if not absolute_path.is_file():
+            raise FileNotFoundError(f"Screenshot not found: {absolute_path}")
+        items.append({"image_path": absolute_path, "step": step})
+    return items, missing
 
 
 def build_messages(
-    trace: dict, system_prompt: str, first_n: int, last_n: int, *,
-    history_mode: str = "full", show_action_mark: bool = True,
-    include_thought: bool = True,
-) -> list[dict]:
-    traj = trace.get("trajectory") or []
-    items = resolve_screenshots(trace["source_json_path"], traj, first_n, last_n)
+    trace: dict,
+    system_prompt: str,
+    first_n: int,
+    last_n: int,
+    *,
+    history_mode: str,
+    show_action_mark: bool,
+    include_thought: bool,
+) -> tuple[list[dict], int]:
+    trajectory = trace.get("trajectory") or []
+    items, missing = resolve_screenshots(
+        trace["source_json_path"], trajectory, first_n, last_n
+    )
     if history_mode == "full":
-        history_text = build_history_text(traj, include_thought=include_thought)
+        history_text = build_history_text(trajectory, include_thought)
     elif history_mode == "selected":
         history_text = build_history_text(
-            [it["step"] for it in items], include_thought=include_thought,
+            [item["step"] for item in items], include_thought
         )
     else:
         history_text = None
 
     content: list[dict] = [
-        {"type": "image_url",
-         "image_url": {"url": image_to_data_url(
-             it["image_path"], it["step"] if show_action_mark else None)}}
-        for it in items
+        {
+            "type": "image_url",
+            "image_url": {
+                "url": image_to_data_url(
+                    item["image_path"], item["step"] if show_action_mark else None
+                )
+            },
+        }
+        for item in items
     ]
     text_parts = [
         f"{len(items)} screenshots from the agent's trajectory have been provided.",
@@ -262,14 +229,11 @@ def build_messages(
     return [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": content},
-    ]
+    ], missing
 
 
-# ── API call ────────────────────────────────────────────────────────────────
-
-
-def _backoff_sleep(attempt: int, base: float = 2.0, cap: float = 60.0):
-    delay = min(base ** attempt, cap)
+def backoff_sleep(attempt: int, base: float = 2.0, cap: float = 60.0) -> None:
+    delay = min(base**attempt, cap)
     time.sleep(delay * (0.5 + 0.5 * random.random()))
 
 
@@ -279,45 +243,104 @@ def call_judge_api(
     api_key: str,
     model_name: str,
     *,
-    temperature: float = 0.0,
-    max_tokens: int | None = None,
-    timeout: int = DEFAULT_TIMEOUT,
-    max_retries: int = DEFAULT_MAX_RETRIES,
+    api_style: str,
+    temperature: float,
+    max_tokens: int | None,
+    timeout: int,
+    max_retries: int,
 ) -> str:
-    client = OpenAI(api_key=api_key, base_url=base_url)
     last_error: Exception | None = None
-    for attempt in range(1, max_retries + 1):
+    # ``max_retries`` counts retries after the initial request. Even zero
+    # retries must still issue one API call.
+    max_attempts = max_retries + 1
+    for attempt in range(1, max_attempts + 1):
         try:
-            kwargs = {"model": model_name, "messages": messages,
-                      "temperature": temperature, "timeout": timeout}
-            if max_tokens is not None:
-                kwargs["max_tokens"] = max_tokens
-            completion = client.chat.completions.create(**kwargs)
-            if not hasattr(completion, "choices") or not completion.choices:
-                raise RuntimeError(f"Unexpected API response (no choices): {completion}")
-            text = completion.choices[0].message.content or ""
-            if text.strip():
-                return text
-            raise RuntimeError("Empty model response")
+            if api_style == "anthropic":
+                system_prompt, native_messages = to_anthropic_messages(messages)
+                client = Anthropic(
+                    api_key=api_key,
+                    base_url=base_url,
+                    timeout=timeout,
+                    max_retries=0,
+                )
+                completion = client.messages.create(
+                    model=model_name,
+                    system=system_prompt,
+                    messages=native_messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens or 1024,
+                )
+                text = "\n".join(
+                    block.text
+                    for block in completion.content
+                    if getattr(block, "type", None) == "text"
+                    and getattr(block, "text", None)
+                )
+            else:
+                client = OpenAI(api_key=api_key, base_url=base_url)
+                kwargs: dict = {
+                    "model": model_name,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "timeout": timeout,
+                }
+                if max_tokens is not None:
+                    kwargs["max_tokens"] = max_tokens
+                completion = client.chat.completions.create(**kwargs)
+                if not completion.choices:
+                    raise RuntimeError("API response contains no choices")
+                text = completion.choices[0].message.content or ""
+            if not text.strip():
+                raise RuntimeError("Empty model response")
+            return text
         except Exception as exc:
             last_error = exc
-            logger.debug("Attempt %d/%d failed for %s: %s",
-                         attempt, max_retries, model_name, exc)
-            if attempt < max_retries:
-                _backoff_sleep(attempt)
-    raise RuntimeError(f"Judge API failed after {max_retries} attempts: {last_error}")
+            logger.debug("Attempt %d/%d failed: %s", attempt, max_attempts, exc)
+            if attempt < max_attempts:
+                backoff_sleep(attempt)
+    raise RuntimeError(f"Judge API failed after {max_attempts} attempts: {last_error}")
 
 
-# ── Response parsing ────────────────────────────────────────────────────────
+def to_anthropic_messages(messages: list[dict]) -> tuple[str, list[dict]]:
+    """Convert the internal OpenAI-style multimodal request to Anthropic blocks."""
+    system_prompt = ""
+    converted: list[dict] = []
+    for message in messages:
+        if message.get("role") == "system":
+            system_prompt = str(message.get("content") or "")
+            continue
+        blocks: list[dict] = []
+        content = message.get("content")
+        if isinstance(content, str):
+            blocks.append({"type": "text", "text": content})
+        elif isinstance(content, list):
+            for item in content:
+                if item.get("type") == "text":
+                    blocks.append({"type": "text", "text": str(item.get("text") or "")})
+                elif item.get("type") == "image_url":
+                    data_url = str((item.get("image_url") or {}).get("url") or "")
+                    match = re.fullmatch(r"data:([^;]+);base64,(.+)", data_url, re.DOTALL)
+                    if not match:
+                        raise ValueError("Anthropic mode requires base64 data-URL images")
+                    blocks.append(
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": match.group(1),
+                                "data": match.group(2),
+                            },
+                        }
+                    )
+        converted.append({"role": message.get("role", "user"), "content": blocks})
+    return system_prompt, converted
 
-# Prefer line-anchored "Judge: SUCCESS|FAIL" (allowing Markdown emphasis);
-# fall back to a global search. The prompt puts the answer at the END of the
-# response, so the LAST match wins over incidental mentions in the Thought.
-_JUDGE_LINE_RE = re.compile(
+
+JUDGE_LINE_RE = re.compile(
     r"^[\s>*_`#-]*judge\s*:\s*\**\s*(success|fail)\w*",
     flags=re.IGNORECASE | re.MULTILINE,
 )
-_JUDGE_ANY_RE = re.compile(
+JUDGE_ANY_RE = re.compile(
     r"\bjudge\s*:\s*\**\s*(success|fail)\w*", flags=re.IGNORECASE
 )
 THOUGHT_RE = re.compile(
@@ -325,142 +348,87 @@ THOUGHT_RE = re.compile(
 )
 
 
-def _last_match(pattern: re.Pattern, text: str):
-    last = None
-    for m in pattern.finditer(text):
-        last = m
-    return last
+def last_match(pattern: re.Pattern, text: str):
+    match = None
+    for candidate in pattern.finditer(text):
+        match = candidate
+    return match
 
 
 def extract_judge_label(text: str) -> str:
-    text = text or ""
-    m = _last_match(_JUDGE_LINE_RE, text) or _last_match(_JUDGE_ANY_RE, text)
-    if not m:
-        raise ValueError(f"Cannot parse judge label from: {text[:200]!r}")
-    label = m.group(1).strip().upper()
-    if label.startswith("SUCC"):
-        return "SUCCESS"
-    if label.startswith("FAIL"):
-        return "FAIL"
-    raise ValueError(f"Unknown judge label: {label}")
+    match = last_match(JUDGE_LINE_RE, text or "") or last_match(JUDGE_ANY_RE, text or "")
+    if not match:
+        raise ValueError(f"Cannot parse judge label from: {(text or '')[:200]!r}")
+    return "SUCCESS" if match.group(1).upper().startswith("SUCC") else "FAIL"
 
 
 def extract_judge_thought(text: str) -> str | None:
-    m = THOUGHT_RE.search(text or "")
-    if m:
-        return m.group(1).strip() or None
+    match = THOUGHT_RE.search(text or "")
+    if match:
+        return match.group(1).strip() or None
     return (text or "").strip() or None
 
 
-def _parse_subscore_value(raw: str | None) -> float | str | None:
-    """Map a captured literal to a number in {0, 0.5, 1} or 'N/A' or None."""
-    if raw is None:
-        return None
-    s = raw.strip().lower().rstrip(".")
-    if s in {"n/a", "na", "n.a.", "n.a"}:
-        return "N/A"
-    try:
-        f = float(s)
-    except ValueError:
-        return None
-    snapped = min(SUBSCORE_LEVELS, key=lambda v: abs(v - f))
-    return snapped if abs(snapped - f) <= 0.05 else None
-
-
-def extract_subscore(text: str, key: str) -> tuple[float | None, str]:
-    """Return (value, status) for an "Alignment:" / "Efficiency:" line.
-    value in {0, 0.5, 1.0} or None; status in {'ok', 'na', 'missing', 'malformed'}.
-    """
-    text = text or ""
-    strict = re.compile(
-        rf"^[\s>*_`-]*{key}(?!_)\s*:\s*\**\s*(1(?:\.0+)?|0\.5+|0(?:\.0+)?|\.5|n/?a)\b",
-        flags=re.IGNORECASE | re.MULTILINE,
+def sanitize_error(exc: Exception) -> str:
+    """Keep diagnostic value without persisting credentials echoed by APIs."""
+    message = str(exc)
+    message = re.sub(r"\bsk-[A-Za-z0-9_*.-]+", "[REDACTED_API_KEY]", message)
+    message = re.sub(
+        r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,'\"}]+",
+        r"\1[REDACTED]",
+        message,
     )
-    m = _last_match(strict, text)
-    if not m:
-        loose = re.compile(
-            rf"\b{key}(?!_)\s*:\s*\**\s*(1(?:\.0+)?|0\.5+|0(?:\.0+)?|\.5|n/?a)\b",
-            flags=re.IGNORECASE,
-        )
-        m = _last_match(loose, text)
-        if not m:
-            return None, "missing"
-    parsed = _parse_subscore_value(m.group(1))
-    if parsed == "N/A":
-        return None, "na"
-    if parsed is None:
-        return None, "malformed"
-    return parsed, "ok"
+    return message
 
 
-# ── Per-sample scoring (OSReward-Multi rules) ───────────────────────────────
+def safe_model_name(model_name: str) -> str:
+    return model_name.replace("/", "_").replace("\\", "_")
 
 
-def score_subscore(gt: float | None, pred: float | None) -> float | None:
-    """Alignment/Efficiency score for one trace: only scored when the gold
-    label is SUCCESS (gt is a number). Missed SUCCESS (pred is None because
-    the model said FAIL or refused to score) scores 0.0; otherwise
-    1 - |gt - pred|, which lives on {0.0, 0.5, 1.0}."""
-    if gt is None:
-        return None
-    if pred is None:
-        return 0.0
-    return round(1.0 - abs(gt - pred), 3)
-
-
-# ── Result I/O ──────────────────────────────────────────────────────────────
-
-
-def output_path_for_model(output_dir: Path, version: str, prompt_type: str,
-                          model_name: str) -> Path:
-    safe = model_name.replace("/", "_").replace("\\", "_")
-    return output_dir / f"judge_{version}_{prompt_type}_{safe}.jsonl"
+def output_path_for_model(output_dir: Path, version: str, model_name: str) -> Path:
+    return output_dir / f"judge_{version}_binary_{safe_model_name(model_name)}.jsonl"
 
 
 def load_existing_results(path: Path) -> dict[str, dict]:
-    recs: dict[str, dict] = {}
+    records: dict[str, dict] = {}
     if not path.exists():
-        return recs
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
+        return records
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
             try:
-                rec = json.loads(line)
+                record = json.loads(line)
             except Exception:
                 continue
-            tid = rec.get("trace_id")
-            if tid:
-                recs[str(tid)] = rec
-    return recs
+            if record.get("trace_id"):
+                records[str(record["trace_id"])] = record
+    return records
 
 
 def write_results_jsonl(path: Path, records: dict[str, dict]) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        for tid in sorted(records):
-            f.write(json.dumps(records[tid], ensure_ascii=False) + "\n")
-
-
-# ── Single-trace judge ──────────────────────────────────────────────────────
-
-PARSE_RETRIES = 1
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        for trace_id in sorted(records):
+            handle.write(json.dumps(records[trace_id], ensure_ascii=False) + "\n")
+    temporary.replace(path)
 
 
 def judge_single_trace(
-    trace: dict, args: argparse.Namespace,
-    system_prompt: str, prompt_version: str,
-    base_url: str, api_key: str, model_name: str,
+    trace: dict,
+    args: argparse.Namespace,
+    system_prompt: str,
+    prompt_version: str,
+    base_url: str,
+    api_key: str,
+    model_name: str,
 ) -> dict:
     started = time.time()
-    prompt_type = args.prompt_type
     result = {
         "trace_id": trace["trace_id"],
         "task_id": trace["task_id"],
         "platform": trace["platform"],
         "agent": trace["agent"],
         "instruction": trace["instruction"],
-        "source_json_path": trace["source_json_path"],
         "num_steps": len(trace.get("trajectory") or []),
         "first_n": "all" if args.first_n >= ALL_STEPS else args.first_n,
         "last_n": "all" if args.last_n >= ALL_STEPS else args.last_n,
@@ -468,22 +436,16 @@ def judge_single_trace(
         "show_action_mark": not args.no_mark,
         "include_thought": not args.no_thought,
         "version": args.version,
-        "prompt_type": prompt_type,
         "prompt_version": prompt_version,
         "judge_model": model_name,
-        "human_label": trace.get("human_label"),
-        "human_alignment": trace.get("human_alignment"),
-        "human_efficiency": trace.get("human_efficiency"),
+        "api_style": args.api_style,
+        "human_label": trace["human_label"],
         "judge_thought": None,
         "judge_label": None,
-        "judge_alignment": None,
-        "judge_efficiency": None,
-        "judge_alignment_status": None,
-        "judge_efficiency_status": None,
         "judge_raw_response": None,
-        "binary_correct": None,
-        "alignment_score": None,
-        "efficiency_score": None,
+        "binary_correct": 0,
+        "selected_screenshot_count": 0,
+        "missing_selected_screenshots": 0,
         "status": "error",
         "error": None,
         "judged_at": datetime.now(timezone.utc).isoformat(),
@@ -491,234 +453,283 @@ def judge_single_trace(
     }
 
     try:
-        messages = build_messages(
-            trace, system_prompt, args.first_n, args.last_n,
+        messages, missing = build_messages(
+            trace,
+            system_prompt,
+            args.first_n,
+            args.last_n,
             history_mode=args.history,
             show_action_mark=not args.no_mark,
             include_thought=not args.no_thought,
         )
+        result["selected_screenshot_count"] = sum(
+            1 for item in messages[1]["content"] if item.get("type") == "image_url"
+        )
+        result["missing_selected_screenshots"] = missing
     except Exception as exc:
-        # Bad trace (missing screenshot, malformed step): record the error row
-        # and keep the run going.
-        result["error"] = str(exc)
+        result["error"] = sanitize_error(exc)
         result["elapsed_seconds"] = round(time.time() - started, 3)
         return result
 
-    last_exc: Exception | None = None
-    for attempt in range(1, PARSE_RETRIES + 2):
+    last_error: Exception | None = None
+    for parse_attempt in range(1, PARSE_RETRIES + 2):
         try:
-            raw = call_judge_api(
-                messages, base_url, api_key, model_name,
-                temperature=args.temperature, max_tokens=args.max_tokens,
-                timeout=args.timeout, max_retries=args.max_retries,
+            raw_response = call_judge_api(
+                messages,
+                base_url,
+                api_key,
+                model_name,
+                api_style=args.api_style,
+                temperature=args.temperature,
+                max_tokens=args.max_tokens,
+                timeout=args.timeout,
+                max_retries=args.max_retries,
             )
-            result["judge_raw_response"] = raw
-            result["judge_thought"] = extract_judge_thought(raw)
-            result["judge_label"] = extract_judge_label(raw)
-            if prompt_type == "multi":
-                align_val, align_status = extract_subscore(raw, "alignment")
-                effic_val, effic_status = extract_subscore(raw, "efficiency")
-                result["judge_alignment"] = align_val
-                result["judge_alignment_status"] = align_status
-                result["judge_efficiency"] = effic_val
-                result["judge_efficiency_status"] = effic_status
+            result["judge_raw_response"] = raw_response
+            result["judge_thought"] = extract_judge_thought(raw_response)
+            result["judge_label"] = extract_judge_label(raw_response)
+            result["binary_correct"] = int(
+                result["judge_label"] == trace["human_label"]
+            )
             result["status"] = "ok"
-            last_exc = None
+            last_error = None
             break
-        except ValueError as parse_exc:
-            # API succeeded but the response was unparseable: retry once.
-            last_exc = parse_exc
-            if attempt < PARSE_RETRIES + 1:
-                _backoff_sleep(attempt, base=2.0, cap=10.0)
-                continue
+        except ValueError as exc:
+            last_error = exc
+            if parse_attempt < PARSE_RETRIES + 1:
+                backoff_sleep(parse_attempt, base=2.0, cap=10.0)
+        except Exception as exc:
+            last_error = exc
             break
-        except Exception as api_exc:
-            last_exc = api_exc
-            break
-
-    if last_exc is not None:
-        result["error"] = str(last_exc)
-
-    # Score against gold when the trace carries it.
-    human_label = trace.get("human_label")
-    if result["status"] == "ok" and human_label and result["judge_label"]:
-        result["binary_correct"] = int(result["judge_label"] == human_label)
-        if prompt_type == "multi" and human_label == "SUCCESS":
-            if result["judge_label"] == "SUCCESS":
-                result["alignment_score"] = score_subscore(
-                    trace.get("human_alignment"), result["judge_alignment"])
-                result["efficiency_score"] = score_subscore(
-                    trace.get("human_efficiency"), result["judge_efficiency"])
-            else:
-                result["alignment_score"] = 0.0
-                result["efficiency_score"] = 0.0
-
+    if last_error is not None:
+        result["error"] = sanitize_error(last_error)
     result["elapsed_seconds"] = round(time.time() - started, 3)
     return result
 
 
-# ── Per-model run ───────────────────────────────────────────────────────────
-
-
 def run_model(
-    model_name: str, traces: list[dict], args: argparse.Namespace,
-    system_prompt: str, prompt_version: str, base_url: str, api_key: str,
+    model_name: str,
+    traces: list[dict],
+    args: argparse.Namespace,
+    system_prompt: str,
+    prompt_version: str,
+    base_url: str,
+    api_key: str,
 ) -> Path:
-    out_path = output_path_for_model(args.output_dir, args.version,
-                                     args.prompt_type, model_name)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    existing = load_existing_results(out_path)
-    done_ids = {tid for tid, r in existing.items() if r.get("status") == "ok"}
-    pending = [t for t in traces if t["trace_id"] not in done_ids]
-    if args.limit is not None:
-        pending = pending[:args.limit]
+    output_path = output_path_for_model(args.output_dir, args.version, model_name)
+    existing = load_existing_results(output_path)
+    expected_ids = {trace["trace_id"] for trace in traces}
+    existing = {key: value for key, value in existing.items() if key in expected_ids}
+    done_ids = {
+        trace_id
+        for trace_id, record in existing.items()
+        if record.get("status") == "ok"
+    }
+    pending = [trace for trace in traces if trace["trace_id"] not in done_ids]
 
     print(f"\n{'=' * 64}")
-    print(f"Model:        {model_name}")
-    print(f"Base URL:     {base_url}")
-    print(f"Prompt:       type={args.prompt_type}  version={prompt_version}")
-    print(f"Output:       {out_path}")
-    print(f"Traces:       {len(traces)}  |  Resumed: {len(done_ids)}  |  Pending: {len(pending)}")
+    print(f"Model:       {model_name}")
+    print(f"Prompt:      {prompt_version}")
+    print(f"Output:      {output_path}")
+    print(f"Traces:      {len(traces)} | Resumed: {len(done_ids)} | Pending: {len(pending)}")
     print(f"{'=' * 64}", flush=True)
 
-    if not pending:
-        print("  Nothing to do.")
-        return out_path
-
-    ok, err = 0, 0
     with ThreadPoolExecutor(max_workers=args.max_workers) as pool:
         futures = [
-            pool.submit(judge_single_trace, t, args, system_prompt,
-                        prompt_version, base_url, api_key, model_name)
-            for t in pending
+            pool.submit(
+                judge_single_trace,
+                trace,
+                args,
+                system_prompt,
+                prompt_version,
+                base_url,
+                api_key,
+                model_name,
+            )
+            for trace in pending
         ]
-        for fut in tqdm(as_completed(futures), total=len(futures),
-                        desc=f"  {model_name}"):
-            res = fut.result()
-            existing[res["trace_id"]] = res
-            write_results_jsonl(out_path, existing)
-            if res["status"] == "ok":
-                ok += 1
-            else:
-                err += 1
-
-    print(f"  OK: {ok}  |  Errors: {err}  |  Written: {out_path}")
-    return out_path
+        for future in tqdm(as_completed(futures), total=len(futures), desc=f"  {model_name}"):
+            result = future.result()
+            existing[result["trace_id"]] = result
+            write_results_jsonl(output_path, existing)
+    return output_path
 
 
-# ── Report ──────────────────────────────────────────────────────────────────
+def compute_metrics(traces: list[dict], result_path: Path) -> dict:
+    results = load_existing_results(result_path)
+    gold_counts = {"SUCCESS": 0, "FAIL": 0}
+    correct_counts = {"SUCCESS": 0, "FAIL": 0}
+    prediction_counts = {"SUCCESS": 0, "FAIL": 0}
+    covered = 0
+    missing_or_error = 0
 
-
-def print_report(model_paths: dict[str, Path], prompt_type: str) -> None:
-    print(f"\n{'#' * 72}")
-    print(f"#  Summary  ({prompt_type} output)")
-    print(f"{'#' * 72}")
-    for model_name, path in model_paths.items():
-        rows = [r for r in load_existing_results(path).values()
-                if r.get("status") == "ok"]
-        if not rows:
-            print(f"\n{model_name}: no successful results.")
+    for trace in traces:
+        label = trace["human_label"]
+        gold_counts[label] += 1
+        result = results.get(trace["trace_id"])
+        if not result or result.get("status") != "ok":
+            missing_or_error += 1
             continue
-        n_succ = sum(1 for r in rows if r.get("judge_label") == "SUCCESS")
-        n_fail = sum(1 for r in rows if r.get("judge_label") == "FAIL")
-        print(f"\n{model_name}  (N={len(rows)})")
-        print(f"  Judge labels:      SUCCESS={n_succ}  FAIL={n_fail}")
-        gold_rows = [r for r in rows if r.get("binary_correct") is not None]
-        if gold_rows:
-            acc = sum(r["binary_correct"] for r in gold_rows) / len(gold_rows)
-            print(f"  Binary accuracy:   {acc * 100:.1f}%  (n={len(gold_rows)} with gold)")
-        if prompt_type == "multi":
-            a = [r["alignment_score"] for r in rows if r.get("alignment_score") is not None]
-            e = [r["efficiency_score"] for r in rows if r.get("efficiency_score") is not None]
-            if a:
-                print(f"  Alignment score:   {sum(a) / len(a):.3f}  (n={len(a)}, gold SUCCESS only)")
-            if e:
-                print(f"  Efficiency score:  {sum(e) / len(e):.3f}  (n={len(e)}, gold SUCCESS only)")
-        for r in rows:
-            align = f"  Alignment={r.get('judge_alignment')}" if prompt_type == "multi" else ""
-            effic = f"  Efficiency={r.get('judge_efficiency')}" if prompt_type == "multi" else ""
-            print(f"    {r['trace_id']}: Judge={r.get('judge_label')}{align}{effic}")
+        prediction = result.get("judge_label")
+        if prediction not in {"SUCCESS", "FAIL"}:
+            missing_or_error += 1
+            continue
+        covered += 1
+        prediction_counts[prediction] += 1
+        if prediction == label:
+            correct_counts[label] += 1
+
+    total = len(traces)
+    correct = sum(correct_counts.values())
+    success_recall = (
+        correct_counts["SUCCESS"] / gold_counts["SUCCESS"]
+        if gold_counts["SUCCESS"]
+        else None
+    )
+    fail_recall = (
+        correct_counts["FAIL"] / gold_counts["FAIL"]
+        if gold_counts["FAIL"]
+        else None
+    )
+    balanced_accuracy = (
+        (success_recall + fail_recall) / 2
+        if success_recall is not None and fail_recall is not None
+        else None
+    )
+    return {
+        "n": total,
+        "gold": gold_counts,
+        "predictions_on_covered": prediction_counts,
+        "covered": covered,
+        "missing_or_error": missing_or_error,
+        "coverage": covered / total,
+        "accuracy": correct / total,
+        "success_recall": success_recall,
+        "fail_recall": fail_recall,
+        "balanced_accuracy": balanced_accuracy,
+        "error_policy": "missing, API-error, and unparseable outputs count as incorrect",
+    }
 
 
-# ── CLI / main ──────────────────────────────────────────────────────────────
+def print_and_save_report(
+    model_paths: dict[str, Path], traces: list[dict], args: argparse.Namespace
+) -> None:
+    print(f"\n{'#' * 72}\n#  Strict binary metrics\n{'#' * 72}")
+    for model_name, path in model_paths.items():
+        metrics = compute_metrics(traces, path)
+        print(f"\n{model_name} (N={metrics['n']})")
+        def percent(value: float | None) -> str:
+            return "N/A" if value is None else f"{value * 100:.1f}%"
+
+        print(f"  Coverage:          {percent(metrics['coverage'])}")
+        print(f"  Balanced Accuracy: {percent(metrics['balanced_accuracy'])}")
+        print(f"  Accuracy:          {percent(metrics['accuracy'])}")
+        print(f"  SUCCESS Recall:    {percent(metrics['success_recall'])}")
+        print(f"  FAIL Recall:       {percent(metrics['fail_recall'])}")
+        report_path = args.output_dir / (
+            f"metrics_{args.version}_binary_{safe_model_name(model_name)}.json"
+        )
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report = {
+            "subset": args.subset,
+            "model": model_name,
+            "version": args.version,
+            "metrics": metrics,
+            "results_file": path.name,
+        }
+        report_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        print(f"  Metrics JSON:      {report_path}")
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="OSReward standalone judge (binary / multi output).",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--traces", nargs="+", type=Path, required=True)
+    parser.add_argument("--models", nargs="+", required=True, metavar="MODEL")
+    parser.add_argument("--subset", choices=["full", "hard", "custom"], default="custom")
+    parser.add_argument(
+        "--api_style",
+        choices=["openai", "anthropic"],
+        default="openai",
+        help="Endpoint wire protocol (default: openai).",
     )
-    p.add_argument("--traces", nargs="+", type=Path, required=True,
-                   help="Trace JSON file(s) and/or directory(ies) to scan recursively.")
-    p.add_argument("--models", nargs="+", required=True, metavar="MODEL",
-                   help="Judge model name(s) served by the endpoint.")
-    p.add_argument("--base_url",
-                   default=os.environ.get("JUDGE_BASE_URL")
-                   or os.environ.get("OPENAI_BASE_URL")
-                   or "https://api.openai.com/v1",
-                   help="OpenAI-compatible endpoint (env: JUDGE_BASE_URL / OPENAI_BASE_URL).")
-    p.add_argument("--api_key",
-                   default=os.environ.get("JUDGE_API_KEY")
-                   or os.environ.get("OPENAI_API_KEY"),
-                   help="API key (env: JUDGE_API_KEY / OPENAI_API_KEY).")
-    p.add_argument("--prompt_type", choices=["binary", "multi"], default="multi",
-                   help="Output mode switch. 'multi' (default) = Judge + Alignment "
-                        "+ Efficiency (OSReward-Multi); 'binary' = Judge only (OSReward).")
-    p.add_argument("--prompt_file", type=Path, default=None,
-                   help="Explicit system prompt file; overrides the --prompt_type default.")
-    p.add_argument("--version", default="demo",
-                   help="Run tag used in output filenames (default: demo).")
-    p.add_argument("--output_dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    p.add_argument("--first_n", type=_int_or_all, default=DEFAULT_FIRST_N,
-                   help="Number of initial screenshots to include, or 'all' (default: 0).")
-    p.add_argument("--last_n", type=_int_or_all, default=DEFAULT_LAST_N,
-                   help="Number of final screenshots to include, or 'all' (default: 5).")
-    p.add_argument("--history", default="full", choices=["full", "selected", "none"],
-                   help="Action history text scope: all steps / only steps with "
-                        "screenshots / none (vision-only).")
-    p.add_argument("--no_thought", action="store_true",
-                   help="Strip agent thoughts from the history text, keeping only actions.")
-    p.add_argument("--no_mark", action="store_true",
-                   help="Disable red-circle action markers on screenshots.")
-    p.add_argument("--temperature", type=float, default=0.0)
-    p.add_argument("--max_tokens", type=int, default=None,
-                   help="Optional max_tokens cap (useful for thinking models).")
-    p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
-                   help=f"Per-call API timeout in seconds (default: {DEFAULT_TIMEOUT}).")
-    p.add_argument("--max_retries", type=int, default=DEFAULT_MAX_RETRIES)
-    p.add_argument("--max_workers", type=int, default=DEFAULT_MAX_WORKERS,
-                   help="Concurrent API calls per model.")
-    p.add_argument("--limit", type=int, default=None,
-                   help="Max traces per model (smoke testing).")
-    return p.parse_args()
+    parser.add_argument(
+        "--base_url",
+        default=None,
+    )
+    parser.add_argument(
+        "--api_key",
+        default=os.environ.get("JUDGE_API_KEY"),
+    )
+    parser.add_argument("--prompt_file", type=Path, default=DEFAULT_PROMPT_FILE)
+    parser.add_argument("--version", default="run")
+    parser.add_argument("--output_dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--first_n", type=int_or_all, default=DEFAULT_FIRST_N)
+    parser.add_argument("--last_n", type=int_or_all, default=DEFAULT_LAST_N)
+    parser.add_argument("--history", choices=["full", "selected", "none"], default="full")
+    parser.add_argument("--no_thought", action="store_true")
+    parser.add_argument("--no_mark", action="store_true")
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--max_tokens", type=int, default=None)
+    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    parser.add_argument("--max_retries", type=int, default=DEFAULT_MAX_RETRIES)
+    parser.add_argument("--max_workers", type=int, default=DEFAULT_MAX_WORKERS)
+    parser.add_argument("--limit", type=int, default=None)
+    return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.api_key is None:
+        if args.api_style == "anthropic":
+            args.api_key = os.environ.get("ANTHROPIC_API_KEY")
+        else:
+            args.api_key = os.environ.get("OPENAI_API_KEY")
+    if args.base_url is None:
+        if args.api_style == "anthropic":
+            args.base_url = (
+                os.environ.get("JUDGE_BASE_URL")
+                or os.environ.get("ANTHROPIC_BASE_URL")
+                or "https://api.anthropic.com"
+            )
+        else:
+            args.base_url = (
+                os.environ.get("JUDGE_BASE_URL")
+                or os.environ.get("OPENAI_BASE_URL")
+                or "https://api.openai.com/v1"
+            )
     if not args.api_key:
-        raise SystemExit("No API key. Pass --api_key or set JUDGE_API_KEY / OPENAI_API_KEY.")
+        raise SystemExit(
+            "No API key. Pass --api_key or set JUDGE_API_KEY, OPENAI_API_KEY, "
+            "or ANTHROPIC_API_KEY."
+        )
+    if args.max_retries < 0:
+        raise SystemExit("--max_retries must be zero or greater.")
     if args.first_n == 0 and args.last_n == 0:
-        raise SystemExit("At least one of --first_n or --last_n must be > 0.")
+        raise SystemExit("At least one of --first_n or --last_n must be greater than zero.")
 
-    prompt_file = args.prompt_file or DEFAULT_PROMPT_FILES[args.prompt_type]
-    system_prompt, prompt_version = load_system_prompt(prompt_file)
-    print(f"Prompt: type={args.prompt_type}  file={prompt_file}  version={prompt_version}")
-
+    system_prompt, prompt_version = load_system_prompt(args.prompt_file)
     traces = discover_traces(args.traces)
     if not traces:
-        raise SystemExit("No traces found.")
-    n_gold = sum(1 for t in traces if t.get("human_label"))
-    print(f"Traces: {len(traces)}  (with gold labels: {n_gold})")
+        raise SystemExit("No binary OSReward traces found.")
+    if args.limit is not None:
+        traces = traces[: args.limit]
+    print(f"Prompt: {args.prompt_file} ({prompt_version})")
+    print(f"Traces: {len(traces)} | Subset: {args.subset}")
 
     model_paths: dict[str, Path] = {}
     for model_name in args.models:
         model_paths[model_name] = run_model(
-            model_name, traces, args, system_prompt, prompt_version,
-            args.base_url, args.api_key,
+            model_name,
+            traces,
+            args,
+            system_prompt,
+            prompt_version,
+            args.base_url,
+            args.api_key,
         )
-
-    print_report(model_paths, args.prompt_type)
+    print_and_save_report(model_paths, traces, args)
 
 
 if __name__ == "__main__":

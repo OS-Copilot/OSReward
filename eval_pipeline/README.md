@@ -1,81 +1,126 @@
-# OSReward standalone judge
+# OSReward binary judge
 
-Self-contained evaluation code for [OSReward](https://arxiv.org/abs/2607.28609):
-a VLM judges whether a GUI-agent trajectory completed the user's task, through
-any OpenAI-compatible API. `--prompt_type` switches the output mode:
+This directory contains the reference evaluator for the public
+[OSReward benchmark](https://huggingface.co/datasets/OS-Copilot/OSreward-bench).
+It runs a multimodal judge through an OpenAI-compatible Chat Completions API or
+the native Anthropic Messages API and reports strict binary metrics.
 
-| `--prompt_type` | Output | Prompt file |
-|---|---|---|
-| `binary` | `Judge: SUCCESS \| FAIL` | `prompts/binary_v1.txt` |
-| `multi` (default) | `Judge` + `Alignment` + `Efficiency` (each in {0, 0.5, 1.0}, N/A on FAIL) | `prompts/multi_v4.txt` |
+## Install
 
-## Setup
+From the OSReward repository root:
 
 ```bash
-pip install -r requirements.txt
-export OPENAI_API_KEY=sk-...            # or JUDGE_API_KEY
-export OPENAI_BASE_URL=https://...      # optional; or JUDGE_BASE_URL / --base_url
+python -m venv .venv
+source .venv/bin/activate
+pip install -r eval_pipeline/requirements.txt
 ```
 
-## Quick start
+## Download the benchmark
+
+Install the Hugging Face CLI, download the complete dataset, and extract the
+screenshot archive:
 
 ```bash
-python run_judge.py --traces example/example_trace.json --models gpt-4o                       # multi
-python run_judge.py --traces example/example_trace.json --models gpt-4o --prompt_type binary  # binary
+pip install -U huggingface_hub
+
+hf download OS-Copilot/OSreward-bench \
+  --repo-type dataset \
+  --local-dir OSReward-Bench
+
+tar -xf OSReward-Bench/screenshots.tar -C OSReward-Bench
 ```
 
-The bundled example is a synthetic 4-step trajectory ("Turn on Dark Mode in
-the Settings app") with gold labels, so the report also prints accuracy.
-Results land in `results/judge_<version>_<prompt_type>_<model>.jsonl`, one row
-per trace; reruns skip traces that already have a `status="ok"` row.
+After extraction, `OSReward-Bench/` contains `data/full`, `data/hard`, and
+`screenshots`. Screenshot paths in every trajectory JSON resolve directly in
+this layout.
 
-## Trace format
+## Run Full or Hard
 
-One JSON per trajectory. `--traces` takes files and/or directories (scanned
-recursively; any JSON with `trace_id` and `task_id` counts as a trace).
+For an OpenAI or OpenAI-compatible endpoint:
 
-```jsonc
-{
-  "trace_id": "...",
-  "task_id": "...",
-  "platform": "Desktop",        // Desktop | Mobile | Web
-  "instruction": "...",
-  "trajectory": [
-    {
-      "step_index": 0,
-      "screenshot_path": "screenshots/step_0000.png",  // relative to this JSON
-      "thought": "...",
-      "action": "click(coordinate=[150, 608])",
-      "coordinate": [150, 608]  // optional; normalized 0-1000, drawn as a red circle
-    }
-  ],
-  // Optional gold labels; enable accuracy scoring in the report:
-  "human_label": "SUCCESS",     // SUCCESS | FAIL
-  "human_alignment": 1.0,       // 0 | 0.5 | 1.0, only meaningful when SUCCESS
-  "human_efficiency": 1.0
-}
+```bash
+export OPENAI_API_KEY=...
+
+python eval_pipeline/run_judge.py \
+  --traces OSReward-Bench/data/full \
+  --subset full \
+  --models gpt-4o \
+  --version full_gpt4o
 ```
 
-## What the judge sees
+To evaluate Hard, change the trace directory and subset:
 
-One API call per trace:
+```bash
+python eval_pipeline/run_judge.py \
+  --traces OSReward-Bench/data/hard \
+  --subset hard \
+  --models gpt-4o \
+  --version hard_gpt4o
+```
 
-- Screenshots of the first `--first_n` and last `--last_n` steps (default:
-  last 5; `all` includes every step), with a red circle at click coordinates
-  (`--no_mark` disables).
-- The instruction and platform.
-- The action history (`--history full | selected | none`; `--no_thought`
-  strips agent thoughts).
+For a custom OpenAI-compatible service, prefer environment variables so the
+credential does not appear in shell history or process arguments:
 
-## Scoring (when gold labels are present)
+```bash
+export JUDGE_API_KEY=...
+export JUDGE_BASE_URL=https://your-endpoint.example/v1
+```
 
-- `binary_correct` = 1 if the predicted label equals `human_label`.
-- Alignment / Efficiency are scored only on gold-SUCCESS traces as
-  `1 - |gold - pred|`; a FAIL verdict or a missing score counts 0.0.
+For an Anthropic-native endpoint:
 
-## Other options
+```bash
+export ANTHROPIC_API_KEY=...
 
-`--version` tags output filenames; `--max_workers` sets concurrent API calls
-per model; `--limit N` judges only the first N traces; `--temperature`,
-`--max_tokens`, `--timeout`, `--max_retries` control the API call;
-`--prompt_file` supplies a custom system prompt.
+python eval_pipeline/run_judge.py \
+  --traces OSReward-Bench/data/full \
+  --subset full \
+  --api_style anthropic \
+  --models claude-opus-4-6 \
+  --version full_claude_opus46
+```
+
+Only send benchmark screenshots and trajectory text to an endpoint you trust.
+Use HTTPS for any remote service.
+
+## Evaluation protocol
+
+The defaults implement the reference binary protocol:
+
+- full thought and action history;
+- the last five screenshots;
+- red action-point markers when normalized coordinates are available;
+- temperature 0;
+- one parsed verdict per trajectory: `Judge: SUCCESS` or `Judge: FAIL`.
+
+Important options:
+
+```text
+--first_n N|all       screenshots from the start (default: 0)
+--last_n N|all        screenshots from the end (default: 5)
+--history MODE        full, selected, or none (default: full)
+--no_thought          remove thoughts but retain actions
+--no_mark             disable normalized action-point markers
+--api_style STYLE     openai or anthropic (default: openai)
+--base_url URL        custom API endpoint
+--max_workers N       concurrent requests per model
+--limit N             evaluate only the first N trace IDs
+```
+
+Results are written incrementally to `eval_pipeline/results/`. Rerunning the
+same model and version resumes completed trajectories. The metrics JSON reports
+Accuracy, Balanced Accuracy, SUCCESS Recall, FAIL Recall, Coverage, and error
+counts. Missing, API-error, and unparseable outputs remain in the denominator
+and count as incorrect.
+
+## Bundled smoke test
+
+The synthetic example can verify installation and API connectivity without
+downloading the benchmark:
+
+```bash
+python eval_pipeline/run_judge.py \
+  --traces eval_pipeline/example/example_trace.json \
+  --subset custom \
+  --models gpt-4o \
+  --version example
+```
