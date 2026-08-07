@@ -1,3 +1,4 @@
 openai>=1.0
-pillow
-tqdm
+anthropic>=0.60
+pillow>=10.0
+tqdm>=4.66
