@@ -1,7 +1,7 @@
 # OSReward binary judge
 
 This directory contains the reference evaluator for the public
-[OSReward benchmark](https://huggingface.co/datasets/OS-Copilot/OSreward-bench).
+[OSReward benchmark](https://huggingface.co/datasets/OS-Copilot/OSReward).
 It runs a multimodal judge through an OpenAI-compatible Chat Completions API or
 the native Anthropic Messages API and reports strict binary metrics.
 
@@ -23,7 +23,7 @@ screenshot archive:
 ```bash
 pip install -U huggingface_hub
 
-hf download OS-Copilot/OSreward-bench \
+hf download OS-Copilot/OSReward \
   --repo-type dataset \
   --local-dir OSReward-Bench
 
