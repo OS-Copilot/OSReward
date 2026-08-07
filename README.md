@@ -47,14 +47,14 @@ Open reward models trained on OS-Shepherd-100K. They supply low-cost, stable, an
 - [x] Android trajectory collection (`trajectory_collection/mobile/`)
 - [ ] Ubuntu trajectory collection (`trajectory_collection/ubuntu/`)
 - [x] Judge analysis on OOD benchmarks (`benchmarking_analysis/`)
-- [ ] OSReward evaluation harness: run any judge on OSReward / -Hard / -Multi and reproduce the leaderboard
+- [x] OSReward evaluation harness: run any judge on OSReward / -Hard / -Multi and reproduce the leaderboard
 - [ ] OS-Shepherd-100K construction pipeline (judgment synthesis + annotation tooling)
 - [ ] OS-Shepherd training (SFT + RL) and inference code
 
 **Data & models**
-- [ ] OSReward benchmark
+- [x] OSReward benchmark
 - [ ] OS-Shepherd-100K corpus
-- [ ] OS-Shepherd-9B / OS-Shepherd-35B checkpoints
+- [x] OS-Shepherd-9B / OS-Shepherd-35B checkpoints
 
 ## 📃 Citation
 
