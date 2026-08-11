@@ -13,7 +13,7 @@ Code, benchmark and data for "OSReward: Instituting Standardized Evaluation for 
 
 ## 🗞️ Updates
 
-- **2026-08**: The [🤗 OSReward benchmark](https://huggingface.co/datasets/OS-Copilot/OSReward), the [🤗 OS-Shepherd-100K](https://huggingface.co/datasets/OS-Copilot/OS-Shepherd-100K) corpus, and the [OS-Shepherd checkpoints](https://huggingface.co/collections/OS-Copilot/osreward-and-os-shepherd) are released, with the reference evaluator in [`eval_pipeline/`](eval_pipeline/). 🔥
+- **2026-08**: We release the [🤗 OSReward benchmark](https://huggingface.co/datasets/OS-Copilot/OSReward), the [🤗 OS-Shepherd-100K](https://huggingface.co/datasets/OS-Copilot/OS-Shepherd-100K) corpus, and the [OS-Shepherd checkpoints](https://huggingface.co/collections/OS-Copilot/osreward-and-os-shepherd). 🔥
 - **2026-07**: Initial release of our [paper](https://arxiv.org/abs/2607.28609) and [🌐 Project Page](https://os-copilot.github.io/OSReward-Home/). 🚀
 
 ## 📏 OSReward
@@ -26,7 +26,12 @@ The benchmark is live on Hugging Face ([🤗 OSReward](https://huggingface.co/da
 
 ### Collection Infrastructure
 
-[`trajectory_collection/`](trajectory_collection/): the cross-platform pipelines behind the benchmark trajectories. Live-web ([`webtrail/`](trajectory_collection/webtrail/)), Windows ([`windows/`](trajectory_collection/windows/), WAA-based), and Android ([`mobile/`](trajectory_collection/mobile/), AndroidWorld-based) are available; Ubuntu is on the way.
+[`trajectory_collection/`](trajectory_collection/): the cross-platform pipelines behind the benchmark trajectories.
+
+- 🌐 **Web** ([`webtrail/`](trajectory_collection/webtrail/)): drives agents through live and self-hosted websites.
+- 🪟 **Windows** ([`windows/`](trajectory_collection/windows/)): collects desktop workflows inside a Windows 11 VM.
+- 📱 **Android** ([`mobile/`](trajectory_collection/mobile/)): collects mobile app trajectories on a live Android emulator.
+- 🐧 **Ubuntu**: on the way.
 
 ### Analysis & Experiments
 
@@ -58,6 +63,8 @@ Open reward models trained on OS-Shepherd-100K. They supply low-cost, stable, an
 - [x] OS-Shepherd-9B / OS-Shepherd-35B checkpoints
 
 ## 📃 Citation
+
+🫶 If you are interested in our work or find the repository / data / checkpoints helpful, please consider using the following citation format when referencing our paper:
 
 ```bibtex
 @article{sun2026osreward,
