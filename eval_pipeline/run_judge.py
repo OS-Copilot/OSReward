@@ -34,6 +34,14 @@ DEFAULT_MAX_RETRIES = 3
 DEFAULT_MAX_WORKERS = 4
 ALL_STEPS = 2**31
 PARSE_RETRIES = 1
+# A response cut off by the completion budget usually ends inside the thought,
+# before the "Judge:" line ever appears. Such traces are retried with a larger
+# budget instead of an identical request.
+TRUNCATION_RETRIES = 2
+ESCALATION_FACTOR = 4
+ESCALATED_MAX_TOKENS_FLOOR = 4096
+ESCALATED_MAX_TOKENS_CAP = 16384
+DEFAULT_ANTHROPIC_MAX_TOKENS = 4096
 
 
 def int_or_all(value: str) -> int:
@@ -248,7 +256,9 @@ def call_judge_api(
     max_tokens: int | None,
     timeout: int,
     max_retries: int,
-) -> str:
+) -> tuple[str, bool]:
+    """Return (response_text, truncated); truncated means the completion
+    budget cut the response off before the model finished."""
     last_error: Exception | None = None
     # ``max_retries`` counts retries after the initial request. Even zero
     # retries must still issue one API call.
@@ -268,7 +278,7 @@ def call_judge_api(
                     system=system_prompt,
                     messages=native_messages,
                     temperature=temperature,
-                    max_tokens=max_tokens or 1024,
+                    max_tokens=max_tokens or DEFAULT_ANTHROPIC_MAX_TOKENS,
                 )
                 text = "\n".join(
                     block.text
@@ -276,6 +286,7 @@ def call_judge_api(
                     if getattr(block, "type", None) == "text"
                     and getattr(block, "text", None)
                 )
+                truncated = completion.stop_reason == "max_tokens"
             else:
                 client = OpenAI(api_key=api_key, base_url=base_url)
                 kwargs: dict = {
@@ -289,16 +300,33 @@ def call_judge_api(
                 completion = client.chat.completions.create(**kwargs)
                 if not completion.choices:
                     raise RuntimeError("API response contains no choices")
-                text = completion.choices[0].message.content or ""
-            if not text.strip():
+                choice = completion.choices[0]
+                text = choice.message.content or ""
+                truncated = choice.finish_reason == "length"
+            if not text.strip() and not truncated:
+                # A truncated-empty response (budget spent on hidden reasoning)
+                # is returned so the caller can escalate the budget; an empty
+                # response with a normal finish is a transient API failure.
                 raise RuntimeError("Empty model response")
-            return text
+            return text, truncated
         except Exception as exc:
             last_error = exc
             logger.debug("Attempt %d/%d failed: %s", attempt, max_attempts, exc)
             if attempt < max_attempts:
                 backoff_sleep(attempt)
     raise RuntimeError(f"Judge API failed after {max_attempts} attempts: {last_error}")
+
+
+def escalate_max_tokens(current: int | None, api_style: str) -> int | None:
+    """Next completion budget to try after a truncated response, or None when
+    the budget is already at the cap."""
+    if current is None:
+        current = DEFAULT_ANTHROPIC_MAX_TOKENS if api_style == "anthropic" else 0
+    escalated = min(
+        max(current * ESCALATION_FACTOR, ESCALATED_MAX_TOKENS_FLOOR),
+        ESCALATED_MAX_TOKENS_CAP,
+    )
+    return escalated if escalated > current else None
 
 
 def to_anthropic_messages(messages: list[dict]) -> tuple[str, list[dict]]:
@@ -443,6 +471,8 @@ def judge_single_trace(
         "judge_thought": None,
         "judge_label": None,
         "judge_raw_response": None,
+        "response_truncated": None,
+        "max_tokens_used": None,
         "binary_correct": 0,
         "selected_screenshot_count": 0,
         "missing_selected_screenshots": 0,
@@ -472,20 +502,28 @@ def judge_single_trace(
         return result
 
     last_error: Exception | None = None
-    for parse_attempt in range(1, PARSE_RETRIES + 2):
+    effective_max_tokens = args.max_tokens
+    plain_retries = PARSE_RETRIES
+    truncation_retries = TRUNCATION_RETRIES
+    truncated = False
+    attempt = 0
+    while True:
+        attempt += 1
         try:
-            raw_response = call_judge_api(
+            raw_response, truncated = call_judge_api(
                 messages,
                 base_url,
                 api_key,
                 model_name,
                 api_style=args.api_style,
                 temperature=args.temperature,
-                max_tokens=args.max_tokens,
+                max_tokens=effective_max_tokens,
                 timeout=args.timeout,
                 max_retries=args.max_retries,
             )
             result["judge_raw_response"] = raw_response
+            result["response_truncated"] = truncated
+            result["max_tokens_used"] = effective_max_tokens
             result["judge_thought"] = extract_judge_thought(raw_response)
             result["judge_label"] = extract_judge_label(raw_response)
             result["binary_correct"] = int(
@@ -496,8 +534,23 @@ def judge_single_trace(
             break
         except ValueError as exc:
             last_error = exc
-            if parse_attempt < PARSE_RETRIES + 1:
-                backoff_sleep(parse_attempt, base=2.0, cap=10.0)
+            if truncated:
+                # Retrying a truncated response at the same budget cannot help;
+                # either escalate the budget or give up.
+                if truncation_retries > 0:
+                    escalated = escalate_max_tokens(
+                        effective_max_tokens, args.api_style
+                    )
+                    if escalated is not None:
+                        effective_max_tokens = escalated
+                        truncation_retries -= 1
+                        continue
+                break
+            if plain_retries > 0:
+                plain_retries -= 1
+                backoff_sleep(attempt, base=2.0, cap=10.0)
+                continue
+            break
         except Exception as exc:
             last_error = exc
             break
