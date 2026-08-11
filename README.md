@@ -13,7 +13,8 @@ Code, benchmark and data for "OSReward: Instituting Standardized Evaluation for 
 
 ## 🗞️ Updates
 
-- **2026-07**: Initial release of our [paper](https://arxiv.org/abs/2607.28609) and [🌐 Project Page](https://os-copilot.github.io/OSReward-Home/). Benchmark, corpus, and model checkpoints are on the way! 🚀
+- **2026-08**: The [🤗 OSReward benchmark](https://huggingface.co/datasets/OS-Copilot/OSReward), the [🤗 OS-Shepherd-100K](https://huggingface.co/datasets/OS-Copilot/OS-Shepherd-100K) corpus, and the [OS-Shepherd checkpoints](https://huggingface.co/collections/OS-Copilot/osreward-and-os-shepherd) are released, with the reference evaluator in [`eval_pipeline/`](eval_pipeline/). 🔥
+- **2026-07**: Initial release of our [paper](https://arxiv.org/abs/2607.28609) and [🌐 Project Page](https://os-copilot.github.io/OSReward-Home/). 🚀
 
 ## 📏 OSReward
 
@@ -21,7 +22,7 @@ VLM judges are now the de-facto reward signal behind CUA evaluation, data curati
 
 ### Benchmark & Evaluation
 
-The benchmark data ([🤗 OSReward](https://huggingface.co/datasets/OS-Copilot/OSReward)) and the evaluation harness (run any judge on OSReward / -Hard / -Multi and reproduce the leaderboard) are on the way.
+The benchmark is live on Hugging Face ([🤗 OSReward](https://huggingface.co/datasets/OS-Copilot/OSReward)): 1,019 Full and 284 Hard trajectories with screenshots and human-gold verdicts. [`eval_pipeline/`](eval_pipeline/) is the reference evaluator: it runs any judge on the Full / Hard splits through an OpenAI-compatible or native Anthropic API and reports the strict binary metrics; see its [README](eval_pipeline/README.md) for download and usage.
 
 ### Collection Infrastructure
 
@@ -33,7 +34,7 @@ The benchmark data ([🤗 OSReward](https://huggingface.co/datasets/OS-Copilot/O
 
 ## 📚 OS-Shepherd-100K
 
-An open corpus of reasoning-annotated CUA trajectory judgments for training and studying reward models, built by a construction pipeline shaped by the benchmark's findings. The corpus ([🤗 OS-Shepherd-100K](https://huggingface.co/datasets/OS-Copilot/OS-Shepherd-100K)) and its construction pipeline are on the way.
+An open corpus of reasoning-annotated CUA trajectory judgments for training and studying reward models, built by a construction pipeline shaped by the benchmark's findings. The corpus is available on Hugging Face ([🤗 OS-Shepherd-100K](https://huggingface.co/datasets/OS-Copilot/OS-Shepherd-100K), gated access) with SFT and RL splits plus format docs; the construction pipeline is on the way.
 
 ## 🐑 OS-Shepherd (9B / 35B)
 
@@ -53,7 +54,7 @@ Open reward models trained on OS-Shepherd-100K. They supply low-cost, stable, an
 
 **Data & models**
 - [x] OSReward benchmark
-- [ ] OS-Shepherd-100K corpus
+- [x] OS-Shepherd-100K corpus
 - [x] OS-Shepherd-9B / OS-Shepherd-35B checkpoints
 
 ## 📃 Citation
