@@ -12,10 +12,10 @@ files named by step so each folder browses as a flat sequence)::
         result.json                    # final status summary for the episode
         judge.json                     # written later by `webtrail judge`
         screenshots/step_000.png       # what the browser rendered
-        model_views/step_000.png       # what the model saw (only if downscaled)
-        annotated/step_000.png         # executed action drawn on the screenshot
-        html/step_000.html
-        axtree/step_000.json
+        model_views/step_000.png       # optional resized copy sent to the model
+        annotated/step_000.png         # optional executed-action visualization
+        html/step_000.html             # optional raw page HTML
+        axtree/step_000.json           # optional accessibility tree
         elements/step_000.json
         states/step_000.json           # url/title/scroll/hashes/guard verdict
         agent/step_000.json            # raw reply, parsed action, resolved
@@ -51,11 +51,15 @@ def _write_json(path: Path, data) -> None:
 class RunRecorder:
     """Run-level files: config snapshot, rejects, api log path."""
 
-    def __init__(self, out_dir: str | Path):
+    def __init__(self, out_dir: str | Path, *, save_html: bool = False,
+                 save_axtree: bool = False, save_model_views: bool = False):
         self.root = Path(out_dir)
         self.trajectories = self.root / "trajectories"
         self.trajectories.mkdir(parents=True, exist_ok=True)
         self._reject_lock = asyncio.Lock()
+        self._save_html = save_html
+        self._save_axtree = save_axtree
+        self._save_model_views = save_model_views
 
     @property
     def api_log_path(self) -> Path:
@@ -92,7 +96,13 @@ class RunRecorder:
             return False
 
     def open_trajectory(self, task: Task) -> "TrajectoryRecorder":
-        return TrajectoryRecorder(self.trajectories / task.task_id, task)
+        return TrajectoryRecorder(
+            self.trajectories / task.task_id,
+            task,
+            save_html=self._save_html,
+            save_axtree=self._save_axtree,
+            save_model_views=self._save_model_views,
+        )
 
 
 def step_file(traj_dir: Path, kind: str, index: int, suffix: str) -> Path:
@@ -101,8 +111,12 @@ def step_file(traj_dir: Path, kind: str, index: int, suffix: str) -> Path:
 
 
 class TrajectoryRecorder:
-    def __init__(self, root: Path, task: Task):
+    def __init__(self, root: Path, task: Task, *, save_html: bool = False,
+                 save_axtree: bool = False, save_model_views: bool = False):
         self.root = root
+        self._save_html = save_html
+        self._save_axtree = save_axtree
+        self._save_model_views = save_model_views
         root.mkdir(parents=True, exist_ok=True)
         self.started_at = time.time()
         _write_json(root / "task.json", {
@@ -123,12 +137,12 @@ class TrajectoryRecorder:
                          model_view_png: bytes | None = None) -> None:
         if state.screenshot_png:
             self._file("screenshots", index, ".png").write_bytes(state.screenshot_png)
-        if model_view_png is not None:
+        if self._save_model_views and model_view_png is not None:
             self._file("model_views", index, ".png").write_bytes(model_view_png)
-        if state.html:
+        if self._save_html and state.html:
             self._file("html", index, ".html").write_text(
                 state.html, encoding="utf-8", errors="replace")
-        if state.axtree is not None:
+        if self._save_axtree and state.axtree is not None:
             _write_json(self._file("axtree", index, ".json"), state.axtree)
         if state.elements is not None:
             _write_json(self._file("elements", index, ".json"), state.elements)
