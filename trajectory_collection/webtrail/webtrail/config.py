@@ -88,7 +88,10 @@ class RunSettings:
     action_profile: str = "hybrid"      # gui | hybrid
     resume: bool = True                 # skip trajectories that already finished
     save_messages: bool = False         # dump full model input (images stripped) per step
-    annotate_screenshots: bool = True   # draw the executed action on a copy
+    save_html: bool = False             # opt-in: raw page HTML is large
+    save_axtree: bool = False           # opt-in: accessibility trees are large
+    save_model_views: bool = False      # opt-in: resized copy sent to the model
+    annotate_screenshots: bool = False  # opt-in: draw the executed action on a copy
     stale_limit: int = 4                # identical page states in a row before aborting
     parse_retries: int = 2              # corrective re-asks for malformed model output
     search_fallbacks: list[str] = field(

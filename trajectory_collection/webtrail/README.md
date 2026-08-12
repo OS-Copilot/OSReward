@@ -7,8 +7,8 @@ scale, with the operational hardening that live-web collection actually needs.
 
 ```
  task file ─► domain governor ─► episode runner ──────────► trajectories/<id>/
-               (per-domain        preflight → observe →        screenshots/  annotated/
-                pacing,            decide → act loop,           html/  axtree/  elements/
+               (per-domain        preflight → observe →        screenshots/  elements/
+                pacing,            decide → act loop,           optional debug evidence
                 cooldowns)         block guard, recovery,       states/  agent/
                                    stale detection              result.json  judge.json
 
@@ -61,12 +61,12 @@ subcommand and writes into the same run directory.
   only against an endpoint that faithfully passes Anthropic tool calls through;
   proxy gateways that reformat tool calls will not work, and Claude runs well
   on the default prompt backend with `pixel` grounding regardless.
-- **Complete step evidence.** Screenshot (plus the exact downscaled copy the
-  model saw, when resizing is on), action-annotated screenshot, raw HTML with
-  same-origin iframe content inlined, accessibility tree, a compact
-  role/name/bbox element map, parsed action + resolved pixel target + executed
-  commands + model usage. `result.json` summarizes each episode in
-  machine-readable form.
+- **Compact evidence by default.** Every step keeps the browser screenshot, a
+  compact role/name/bbox element map, parsed action, resolved pixel target,
+  executed commands, and model usage. Raw HTML, accessibility trees, resized
+  model-view copies, and action-annotated screenshots are opt-in via
+  `--save-html`, `--save-axtree`, `--save-model-views`, and `--save-annotated`.
+  `result.json` summarizes each episode in machine-readable form.
 - **Robust on the live web.** Rule-based block detection, JS-challenge grace
   waits, search-engine fallback, block recovery with a per-episode blocked-site
   denylist, multi-URL preflight, per-domain pacing and cooldown. See
@@ -134,7 +134,8 @@ Node 18+ is required.
 
 ## Tasks
 
-Collection reads a small JSONL of `{url, instruction, ...}`. To pull tasks from
+Collection reads a small JSONL whose acting-agent fields are `{url,
+instruction}`. To pull tasks from
 an existing dataset instead of hand-writing them, `tasks import` maps foreign
 column names (`website`, `confirmed_task`, `ques`, `goal`, …) onto that schema,
 drops records missing a URL or instruction, and de-duplicates:
@@ -165,10 +166,11 @@ webtrail collect \
   --max-steps 30 --profile hybrid
 ```
 
-Tasks are JSONL with `url` (or `urls` for a multi-site task), `instruction`,
-and optional `steps`, `criteria`, `max_steps`, `action_profile`, `id`. The
-current date is injected into every prompt, so date-relative instructions
-("next Saturday") resolve correctly.
+The acting agent receives only the task `instruction` and the live current
+`url`. Gold `steps`, `criteria`, and other dataset metadata may remain attached
+to the internal task record for judging and analysis, but are never inserted
+into the agent prompt. The bundled `tasks/example.jsonl` therefore contains
+only `url` and `instruction` fields.
 
 Useful variants:
 
@@ -319,10 +321,10 @@ runs/demo/
     result.json          status, block info, counters, action keys, timing
     judge.json           written by `webtrail judge`
     screenshots/step_000.png ...     browser captures, one per step
-    annotated/step_001.png ...       executed action drawn on the capture
-    model_views/step_000.png ...     exact model input (only when downscaled)
-    html/step_000.html ...           raw page HTML with same-origin iframes
-    axtree/step_000.json ...         accessibility tree
+    annotated/step_001.png ...       optional (--save-annotated)
+    model_views/step_000.png ...     optional (--save-model-views)
+    html/step_000.html ...           optional (--save-html)
+    axtree/step_000.json ...         optional (--save-axtree)
     elements/step_000.json ...       interactive element map
     states/step_000.json ...         url/title/scroll/hashes/guard verdict
     agent/step_000.json ...          reply, parsed action, resolved target

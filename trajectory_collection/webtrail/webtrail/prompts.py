@@ -7,8 +7,6 @@ targets. Nothing here depends on a specific model family.
 
 from __future__ import annotations
 
-import datetime
-
 from . import actions
 from .grounding import GroundingContext
 from .types import PageState, Task
@@ -83,22 +81,9 @@ def system_prompt(profile: str, ctx: GroundingContext, analysis_words: int) -> s
 
 
 def task_block(task: Task) -> str:
-    # date-relative instructions ("next Saturday", "tomorrow") are unresolvable
-    # without an anchor, so every task states the current date
-    today = datetime.date.today()
-    lines = ["## Task", "",
-             f"(Today is {today.strftime('%A, %Y-%m-%d')}.)", "",
-             task.instruction.strip()]
-    if len(task.urls) > 1:
-        lines += ["", "Required URLs (visit all of them):"]
-        lines += [f"- {url}" for url in task.urls]
-    if task.steps:
-        lines += ["", "Reference steps:"]
-        lines += [f"{i}. {step}" for i, step in enumerate(task.steps, 1)]
-    if task.criteria:
-        lines += ["", "The task counts as done when:"]
-        lines += [f"- {criterion}" for criterion in task.criteria]
-    return "\n".join(lines)
+    # Only the instruction is task input.  `steps` and `criteria` are gold
+    # annotations and may contain the literal answer or intended action path.
+    return "\n".join(["## Task", "", task.instruction.strip()])
 
 
 def step_block(task: Task, state: PageState, step_index: int, max_steps: int,
@@ -109,10 +94,9 @@ def step_block(task: Task, state: PageState, step_index: int, max_steps: int,
         f"## Current state — step {step_index + 1} of {max_steps}",
     ]
     if not vision_only:
-        # URL and page title are lightweight state cues; omitting them forces
-        # the agent to read everything, including its location, from the pixels
-        lines += ["", f"URL: {state.url}",
-                  f"Page title: {state.title or '(unknown)'}"]
+        # The live URL is the only non-visual page-state field given to the
+        # agent.  Gold steps/criteria and other task metadata stay hidden.
+        lines += ["", f"URL: {state.url}"]
     if notices:
         lines += ["", "Notices:"]
         lines += [f"- {notice}" for notice in notices]

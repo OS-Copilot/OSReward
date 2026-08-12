@@ -54,7 +54,12 @@ async def run_collection(config: Config, tasks: list[Task],
     rank, world = shard
     tasks = [task for index, task in enumerate(tasks) if index % world == rank]
 
-    recorder = RunRecorder(config.run.out_dir)
+    recorder = RunRecorder(
+        config.run.out_dir,
+        save_html=config.run.save_html,
+        save_axtree=config.run.save_axtree,
+        save_model_views=config.run.save_model_views,
+    )
     recorder.save_config(config.to_dict())
 
     if config.run.resume:
@@ -176,6 +181,14 @@ def add_parser(subparsers) -> None:
     parser.add_argument("--per-domain", type=int)
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--save-messages", action="store_true")
+    parser.add_argument("--save-html", action="store_true",
+                        help="save raw page HTML for every step (off by default)")
+    parser.add_argument("--save-axtree", action="store_true",
+                        help="save accessibility trees for every step (off by default)")
+    parser.add_argument("--save-model-views", action="store_true",
+                        help="save resized images sent to the model (off by default)")
+    parser.add_argument("--save-annotated", action="store_true",
+                        help="save action-annotated screenshots (off by default)")
 
     parser.add_argument("--rank", type=int, default=0, help="shard index")
     parser.add_argument("--world-size", type=int, default=1, help="shard count")
@@ -215,6 +228,14 @@ def build_config(args: argparse.Namespace) -> Config:
         overrides["run.resume"] = False
     if args.save_messages:
         overrides["run.save_messages"] = True
+    if args.save_html:
+        overrides["run.save_html"] = True
+    if args.save_axtree:
+        overrides["run.save_axtree"] = True
+    if args.save_model_views:
+        overrides["run.save_model_views"] = True
+    if args.save_annotated:
+        overrides["run.annotate_screenshots"] = True
     return Config.load(args.config, overrides)
 
 
