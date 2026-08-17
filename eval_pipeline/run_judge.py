@@ -42,6 +42,17 @@ ESCALATION_FACTOR = 4
 ESCALATED_MAX_TOKENS_FLOOR = 4096
 ESCALATED_MAX_TOKENS_CAP = 16384
 DEFAULT_ANTHROPIC_MAX_TOKENS = 4096
+PARQUET_METADATA_COLUMNS = [
+    "trace_id",
+    "task_id",
+    "platform",
+    "agent",
+    "instruction",
+    "frame_semantics",
+    "trajectory_length",
+    "trajectory",
+    "human_label",
+]
 
 
 def int_or_all(value: str) -> int:
@@ -59,16 +70,29 @@ def load_system_prompt(path: Path) -> tuple[str, str]:
     return path.read_text(encoding="utf-8").strip(), path.stem
 
 
-def discover_traces(paths: list[Path]) -> list[dict]:
-    json_paths: list[Path] = []
-    for path in paths:
-        if path.is_dir():
-            json_paths.extend(sorted(path.rglob("*.json")))
-        elif path.is_file():
-            json_paths.append(path)
-        else:
-            raise FileNotFoundError(f"Trace path not found: {path}")
+def trace_record(data: dict, **source: object) -> dict:
+    return {
+        "trace_id": str(data["trace_id"]),
+        "task_id": str(data["task_id"]),
+        "platform": str(data.get("platform", "")),
+        "agent": str(data.get("agent", "")),
+        "instruction": str(data.get("instruction", "")),
+        "trajectory": data.get("trajectory") or [],
+        "human_label": data["human_label"],
+        **source,
+    }
 
+
+def is_binary_trace(data: object) -> bool:
+    return bool(
+        isinstance(data, dict)
+        and data.get("trace_id")
+        and data.get("task_id")
+        and data.get("human_label") in {"SUCCESS", "FAIL"}
+    )
+
+
+def discover_json_traces(json_paths: list[Path]) -> list[dict]:
     records: list[dict] = []
     seen: set[str] = set()
     for json_path in json_paths:
@@ -80,30 +104,125 @@ def discover_traces(paths: list[Path]) -> list[dict]:
         except Exception as exc:
             print(f"  [skip] invalid JSON: {json_path} ({exc})")
             continue
-        if not (
-            isinstance(data, dict)
-            and data.get("trace_id")
-            and data.get("task_id")
-            and data.get("human_label") in {"SUCCESS", "FAIL"}
-        ):
+        if not is_binary_trace(data):
             continue
         trace_id = str(data["trace_id"])
         if trace_id in seen:
             raise ValueError(f"Duplicate trace_id in input: {trace_id}")
         seen.add(trace_id)
-        records.append(
-            {
-                "trace_id": trace_id,
-                "task_id": str(data["task_id"]),
-                "platform": str(data.get("platform", "")),
-                "agent": str(data.get("agent", "")),
-                "instruction": str(data.get("instruction", "")),
-                "trajectory": data.get("trajectory") or [],
-                "source_json_path": str(json_path),
-                "human_label": data["human_label"],
-            }
-        )
+        records.append(trace_record(data, source_json_path=str(json_path)))
     return sorted(records, key=lambda record: record["trace_id"])
+
+
+def discover_parquet_traces(parquet_paths: list[Path]) -> list[dict]:
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise SystemExit(
+            "pyarrow is required for Parquet input; install eval_pipeline/requirements.txt"
+        ) from exc
+
+    records: list[dict] = []
+    seen: set[str] = set()
+    required = set(PARQUET_METADATA_COLUMNS) | {"screenshots"}
+    for parquet_path in sorted(parquet_paths):
+        parquet_file = pq.ParquetFile(parquet_path)
+        available = set(parquet_file.schema_arrow.names)
+        missing = required - available
+        if missing:
+            raise ValueError(f"Missing Parquet columns in {parquet_path}: {sorted(missing)}")
+        table = parquet_file.read(columns=PARQUET_METADATA_COLUMNS)
+        locations = [
+            (row_group, row_index)
+            for row_group in range(parquet_file.num_row_groups)
+            for row_index in range(parquet_file.metadata.row_group(row_group).num_rows)
+        ]
+        rows = table.to_pylist()
+        if len(rows) != len(locations):
+            raise ValueError(f"Parquet row metadata mismatch in {parquet_path}")
+        for data, (row_group, row_index) in zip(rows, locations):
+            if not is_binary_trace(data):
+                raise ValueError(
+                    f"Invalid binary trace in {parquet_path}, row group {row_group}, "
+                    f"row {row_index}"
+                )
+            trace_id = str(data["trace_id"])
+            if trace_id in seen:
+                raise ValueError(f"Duplicate trace_id in input: {trace_id}")
+            seen.add(trace_id)
+            records.append(
+                trace_record(
+                    data,
+                    source_parquet_path=str(parquet_path),
+                    source_parquet_row_group=row_group,
+                    source_parquet_row_index=row_index,
+                )
+            )
+    return sorted(records, key=lambda record: record["trace_id"])
+
+
+def discover_traces(paths: list[Path]) -> list[dict]:
+    json_paths: list[Path] = []
+    parquet_paths: list[Path] = []
+    for path in paths:
+        if path.is_dir():
+            json_paths.extend(sorted(path.rglob("*.json")))
+            parquet_paths.extend(sorted(path.rglob("*.parquet")))
+        elif path.is_file():
+            if path.suffix.lower() == ".parquet":
+                parquet_paths.append(path)
+            else:
+                json_paths.append(path)
+        else:
+            raise FileNotFoundError(f"Trace path not found: {path}")
+    if json_paths and parquet_paths:
+        raise ValueError(
+            "Input contains both JSON and Parquet traces; pass one format at a time."
+        )
+    if parquet_paths:
+        return discover_parquet_traces(parquet_paths)
+    return discover_json_traces(json_paths)
+
+
+def discover_hf_dataset_traces(
+    dataset_id: str,
+    subset: str,
+    *,
+    revision: str | None,
+    cache_dir: Path | None,
+) -> list[dict]:
+    local_candidate = Path(dataset_id).expanduser()
+    if local_candidate.exists():
+        dataset_root = local_candidate.resolve()
+    else:
+        try:
+            from huggingface_hub import snapshot_download
+        except ImportError as exc:
+            raise SystemExit(
+                "huggingface_hub is required for --dataset; install "
+                "eval_pipeline/requirements.txt"
+            ) from exc
+        dataset_root = Path(
+            snapshot_download(
+                repo_id=dataset_id,
+                repo_type="dataset",
+                revision=revision,
+                cache_dir=str(cache_dir) if cache_dir else None,
+                allow_patterns=[
+                    f"parquet/{subset}/*.parquet",
+                    f"data/{subset}/*.parquet",
+                ],
+            )
+        )
+
+    parquet_paths = sorted((dataset_root / "parquet" / subset).glob("*.parquet"))
+    if not parquet_paths:
+        parquet_paths = sorted((dataset_root / "data" / subset).glob("*.parquet"))
+    if not parquet_paths:
+        raise FileNotFoundError(
+            f"No Parquet shards for subset {subset!r} under {dataset_root}"
+        )
+    return discover_parquet_traces(parquet_paths)
 
 
 def is_valid_norm_point(value: object) -> bool:
@@ -116,10 +235,34 @@ def is_valid_norm_point(value: object) -> bool:
     return 0 <= x <= 1000 and 0 <= y <= 1000
 
 
-def image_to_data_url(image_path: Path, step: dict | None = None) -> str:
-    mime_type, _ = mimetypes.guess_type(str(image_path))
+def image_to_data_url(
+    image_source: Path | dict | bytes,
+    step: dict | None = None,
+    *,
+    base_dir: Path | None = None,
+) -> str:
+    source_name = ""
+    if isinstance(image_source, Path):
+        source_name = str(image_source)
+        image_bytes = image_source.read_bytes()
+    elif isinstance(image_source, bytes):
+        image_bytes = image_source
+    elif isinstance(image_source, dict):
+        source_name = str(image_source.get("path") or "")
+        image_bytes = image_source.get("bytes")
+        if image_bytes is None and source_name:
+            image_path = Path(source_name)
+            if not image_path.is_absolute() and base_dir is not None:
+                image_path = base_dir / image_path
+            image_bytes = image_path.read_bytes()
+    else:
+        raise TypeError(f"Unsupported image value: {type(image_source).__name__}")
+    if not isinstance(image_bytes, bytes) or not image_bytes:
+        raise ValueError(f"Embedded image has no bytes: {source_name or '[unnamed]'}")
+
+    mime_type, _ = mimetypes.guess_type(source_name)
     if step and is_valid_norm_point(step.get("coordinate")):
-        with Image.open(image_path) as raw_image:
+        with Image.open(io.BytesIO(image_bytes)) as raw_image:
             image = raw_image.convert("RGB")
             width, height = image.size
             nx, ny = step["coordinate"]
@@ -139,7 +282,6 @@ def image_to_data_url(image_path: Path, step: dict | None = None) -> str:
         mime_type = "image/png"
     else:
         mime_type = mime_type or "image/png"
-        image_bytes = image_path.read_bytes()
     encoded = base64.b64encode(image_bytes).decode("utf-8")
     return f"data:{mime_type};base64,{encoded}"
 
@@ -162,7 +304,7 @@ def build_history_text(trajectory: list[dict], include_thought: bool = True) -> 
 
 
 def resolve_screenshots(
-    source_json_path: str,
+    trace: dict,
     trajectory: list[dict],
     first_n: int,
     last_n: int,
@@ -176,19 +318,58 @@ def resolve_screenshots(
         indices.update(range(min(first_n, total)))
     if last_n > 0:
         indices.update(range(max(0, total - last_n), total))
-    json_dir = Path(source_json_path).resolve().parent
+    embedded_screenshots: list[object] | None = None
+    parquet_path_value = trace.get("source_parquet_path")
+    if parquet_path_value:
+        try:
+            import pyarrow.parquet as pq
+        except ImportError as exc:
+            raise RuntimeError("pyarrow is required to read embedded screenshots") from exc
+        parquet_path = Path(str(parquet_path_value))
+        parquet_file = pq.ParquetFile(parquet_path)
+        table = parquet_file.read_row_group(
+            int(trace["source_parquet_row_group"]), columns=["screenshots"]
+        )
+        rows = table.to_pylist()
+        embedded_screenshots = rows[int(trace["source_parquet_row_index"])][
+            "screenshots"
+        ]
+        if len(embedded_screenshots) != total:
+            raise ValueError(
+                f"Screenshot/trajectory length mismatch for {trace['trace_id']}: "
+                f"{len(embedded_screenshots)} != {total}"
+            )
+
+    json_dir = None
+    if trace.get("source_json_path"):
+        json_dir = Path(str(trace["source_json_path"])).resolve().parent
     items: list[dict] = []
     missing = 0
     for index in sorted(indices):
         step = trajectory[index]
-        relative_path = step.get("screenshot_path")
-        if not relative_path or not isinstance(relative_path, str):
-            missing += 1
-            continue
-        absolute_path = (json_dir / relative_path).resolve()
-        if not absolute_path.is_file():
-            raise FileNotFoundError(f"Screenshot not found: {absolute_path}")
-        items.append({"image_path": absolute_path, "step": step})
+        if embedded_screenshots is not None:
+            image_source = embedded_screenshots[index]
+            if image_source is None:
+                missing += 1
+                continue
+            items.append(
+                {
+                    "image_source": image_source,
+                    "image_base_dir": Path(str(parquet_path_value)).parent,
+                    "step": step,
+                }
+            )
+        else:
+            relative_path = step.get("screenshot_path")
+            if not relative_path or not isinstance(relative_path, str):
+                missing += 1
+                continue
+            if json_dir is None:
+                raise ValueError(f"No screenshot source for trace {trace['trace_id']}")
+            absolute_path = (json_dir / relative_path).resolve()
+            if not absolute_path.is_file():
+                raise FileNotFoundError(f"Screenshot not found: {absolute_path}")
+            items.append({"image_source": absolute_path, "step": step})
     return items, missing
 
 
@@ -203,9 +384,7 @@ def build_messages(
     include_thought: bool,
 ) -> tuple[list[dict], int]:
     trajectory = trace.get("trajectory") or []
-    items, missing = resolve_screenshots(
-        trace["source_json_path"], trajectory, first_n, last_n
-    )
+    items, missing = resolve_screenshots(trace, trajectory, first_n, last_n)
     if history_mode == "full":
         history_text = build_history_text(trajectory, include_thought)
     elif history_mode == "selected":
@@ -220,7 +399,9 @@ def build_messages(
             "type": "image_url",
             "image_url": {
                 "url": image_to_data_url(
-                    item["image_path"], item["step"] if show_action_mark else None
+                    item["image_source"],
+                    item["step"] if show_action_mark else None,
+                    base_dir=item.get("image_base_dir"),
                 )
             },
         }
@@ -698,9 +879,21 @@ def print_and_save_report(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--traces", nargs="+", type=Path, required=True)
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument(
+        "--traces",
+        nargs="+",
+        type=Path,
+        help="Local legacy JSON files/directories or Parquet shards/directories.",
+    )
+    inputs.add_argument(
+        "--dataset",
+        help="Hugging Face dataset ID or local dataset root containing Parquet shards.",
+    )
     parser.add_argument("--models", nargs="+", required=True, metavar="MODEL")
-    parser.add_argument("--subset", choices=["full", "hard", "custom"], default="custom")
+    parser.add_argument("--subset", choices=["full", "hard", "custom"], default=None)
+    parser.add_argument("--dataset_revision", default=None)
+    parser.add_argument("--cache_dir", type=Path, default=None)
     parser.add_argument(
         "--api_style",
         choices=["openai", "anthropic"],
@@ -734,6 +927,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.subset is None:
+        args.subset = "full" if args.dataset else "custom"
+    if args.dataset and args.subset == "custom":
+        raise SystemExit("--dataset requires --subset full or --subset hard.")
     if args.api_key is None:
         if args.api_style == "anthropic":
             args.api_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -763,7 +960,15 @@ def main() -> None:
         raise SystemExit("At least one of --first_n or --last_n must be greater than zero.")
 
     system_prompt, prompt_version = load_system_prompt(args.prompt_file)
-    traces = discover_traces(args.traces)
+    if args.dataset:
+        traces = discover_hf_dataset_traces(
+            args.dataset,
+            args.subset,
+            revision=args.dataset_revision,
+            cache_dir=args.cache_dir,
+        )
+    else:
+        traces = discover_traces(args.traces)
     if not traces:
         raise SystemExit("No binary OSReward traces found.")
     if args.limit is not None:
