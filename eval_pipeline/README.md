@@ -15,24 +15,12 @@ source .venv/bin/activate
 pip install -r eval_pipeline/requirements.txt
 ```
 
-## Download the benchmark
+## Dataset loading
 
-Install the Hugging Face CLI, download the complete dataset, and extract the
-screenshot archive:
-
-```bash
-pip install -U huggingface_hub
-
-hf download OS-Copilot/OSReward \
-  --repo-type dataset \
-  --local-dir OSReward-Bench
-
-tar -xf OSReward-Bench/screenshots.tar -C OSReward-Bench
-```
-
-After extraction, `OSReward-Bench/` contains `data/full`, `data/hard`, and
-`screenshots`. Screenshot paths in every trajectory JSON resolve directly in
-this layout.
+The evaluator downloads the selected Parquet configuration from Hugging Face.
+Screenshots are embedded as an image column, so no TAR extraction is required.
+Only Parquet metadata is read while traces are indexed; image bytes are loaded
+from the selected trajectory when its request is built.
 
 ## Run Full or Hard
 
@@ -42,17 +30,17 @@ For an OpenAI or OpenAI-compatible endpoint:
 export OPENAI_API_KEY=...
 
 python eval_pipeline/run_judge.py \
-  --traces OSReward-Bench/data/full \
+  --dataset OS-Copilot/OSReward \
   --subset full \
   --models gpt-4o \
   --version full_gpt4o
 ```
 
-To evaluate Hard, change the trace directory and subset:
+To evaluate Hard, change only the subset:
 
 ```bash
 python eval_pipeline/run_judge.py \
-  --traces OSReward-Bench/data/hard \
+  --dataset OS-Copilot/OSReward \
   --subset hard \
   --models gpt-4o \
   --version hard_gpt4o
@@ -72,7 +60,7 @@ For an Anthropic-native endpoint:
 export ANTHROPIC_API_KEY=...
 
 python eval_pipeline/run_judge.py \
-  --traces OSReward-Bench/data/full \
+  --dataset OS-Copilot/OSReward \
   --subset full \
   --api_style anthropic \
   --models claude-opus-4-6 \
@@ -95,6 +83,10 @@ The defaults implement the reference binary protocol:
 Important options:
 
 ```text
+--dataset DATASET     Hugging Face dataset ID or local dataset repository
+--traces PATH [...]   local Parquet shards or legacy JSON traces
+--dataset_revision R  optional Hugging Face branch, tag, or commit
+--cache_dir PATH      optional Hugging Face download cache
 --first_n N|all       screenshots from the start (default: 0)
 --last_n N|all        screenshots from the end (default: 5)
 --history MODE        full, selected, or none (default: full)
@@ -111,6 +103,21 @@ same model and version resumes completed trajectories. The metrics JSON reports
 Accuracy, Balanced Accuracy, SUCCESS Recall, FAIL Recall, Coverage, and error
 counts. Missing, API-error, and unparseable outputs remain in the denominator
 and count as incorrect.
+
+The public Parquet schema keeps one trajectory per row. `screenshots[i]` is the
+image for `trajectory[i]`; unavailable images are represented by `None`. Local
+Parquet shards can be evaluated without Hugging Face access:
+
+```bash
+python eval_pipeline/run_judge.py \
+  --traces /path/to/parquet/hard \
+  --subset hard \
+  --models gpt-4o \
+  --version local_hard_gpt4o
+```
+
+`--traces` continues to accept the legacy extracted JSON layout and custom JSON
+records, so existing local experiments remain reproducible.
 
 ## Bundled smoke test
 
