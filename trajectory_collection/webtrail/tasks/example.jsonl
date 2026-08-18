@@ -1,4 +1,0 @@
-{"url": "https://en.wikipedia.org/wiki/Web_browser", "instruction": "Find the release year of the first version of Mosaic mentioned in this article and stop with the answer."}
-{"url": "https://duckduckgo.com", "instruction": "Search for the tallest building in the world and report its height in meters."}
-{"url": "https://arxiv.org", "instruction": "Open the most recent listing for cs.CL and report the title of the first paper."}
-{"url": "https://www.python.org", "instruction": "Report the latest stable Python version shown on python.org."}

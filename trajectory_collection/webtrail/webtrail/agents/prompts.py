@@ -7,9 +7,9 @@ targets. Nothing here depends on a specific model family.
 
 from __future__ import annotations
 
-from . import actions
-from .grounding import GroundingContext
-from .types import PageState, Task
+from ..browser import actions
+from ..browser.grounding import GroundingContext
+from ..core.models import PageState, Task
 
 RESPONSE_CONTRACT = """## How to respond
 
@@ -23,7 +23,10 @@ fenced block:
 ```
 
 Never output more than one JSON block. Never invent action names or argument
-fields that are not documented above."""
+fields that are not documented above. Explicitly judge the previous action as
+successful, failed, or uncertain from the current screenshot. An Action Result
+only confirms whether the browser command executed; it does not by itself prove
+that the intended page change happened."""
 
 GROUND_RULES = """## Ground rules
 
@@ -63,27 +66,68 @@ GROUND_RULES = """## Ground rules
   with a concise answer containing the information you gathered. Do not keep
   browsing after that."""
 
+GOTO_RULES = """## URL navigation rules
+
+- Prefer clicking visible links, menus, search results, and page controls. For
+  filters and searches, operate the site's UI instead of constructing a URL.
+- Never invent or guess a URL path, article slug, filename, query string, or
+  filter parameter from a page title, task wording, or a site's apparent URL
+  pattern. A plausible-looking URL is not evidence that the page exists.
+- Use `goto` only with an exact full URL copied verbatim from the task, the
+  current state, a notice or prior browser result, or text visibly displayed on
+  the page. The only exception is opening one of these known search-engine
+  homepages: start with `https://www.bing.com`; if Bing is blocked, explicitly
+  switch to `https://duckduckgo.com`, then use `https://www.google.com` only as
+  the last fallback. Enter the query through the homepage's search field.
+- If a search engine shows a CAPTCHA, verification page, rate limit, or server
+  error, do not reload, wait on, or repeatedly retry that engine. Use `goto` to
+  switch explicitly to the next search-engine homepage listed above.
+- On a search-results page, click the visible result. Do not convert its title
+  into a guessed destination URL.
+- If a URL produces a missing-page, access-denied, or server-error notice, do
+  not try variations of its path or slug. Use the recovered page, visible links,
+or a search engine to find a verified route."""
+
+SCROLL_RULES = """## Scroll limit
+
+- Never issue more than five `scroll` actions in consecutive turns. Scrolling
+  up versus down, changing the distance, or changing the pointer position does
+  not reset this count.
+- After five consecutive scrolls, the next action MUST be a non-scroll action
+  such as `click`, `type`, `select_option`, `goto`, `go_back`, or `stop`.
+- Repeatedly scrolling up and down over the same page is not progress. If five
+  scrolls have not revealed a useful next action or the required evidence,
+  choose a different route or `stop` with the best supported answer available."""
+
 
 def system_prompt(profile: str, ctx: GroundingContext, analysis_words: int) -> str:
     switch_hint = (
-        " (use `goto` with an alternative such as https://duckduckgo.com)"
+        " (try Bing first, then DuckDuckGo, with Google as the last fallback)"
         if profile == "hybrid" else ""
     )
-    return "\n\n".join([
-        "You operate a real desktop web browser to carry out the user's task on "
-        "live websites. At each step you see a screenshot of the current viewport "
-        "and reply with the single next action.",
+    sections = [
+        (
+            "You operate a real desktop web browser to carry out the user's task on "
+            "live websites. At each step you see a screenshot of the current viewport "
+            "and reply with the single next action."
+        ),
         "## Locating targets\n\n" + ctx.scheme.doc_convention,
         "## Available actions\n\n" + actions.catalog(profile, ctx),
+    ]
+    if profile == "hybrid":
+        sections.append(GOTO_RULES)
+    sections.extend([
+        SCROLL_RULES,
         GROUND_RULES.format(switch_hint=switch_hint),
         RESPONSE_CONTRACT.format(analysis_words=analysis_words),
     ])
+    return "\n\n".join(sections)
 
 
 def task_block(task: Task) -> str:
-    # Only the instruction is task input.  `steps` and `criteria` are gold
-    # annotations and may contain the literal answer or intended action path.
-    return "\n".join(["## Task", "", task.instruction.strip()])
+    # The acting agent receives only the instruction.  Gold `steps`,
+    # `criteria`, and all other task metadata stay out of its prompt.
+    return f"## Task\n\n{task.instruction.strip()}"
 
 
 def step_block(task: Task, state: PageState, step_index: int, max_steps: int,
@@ -94,14 +138,18 @@ def step_block(task: Task, state: PageState, step_index: int, max_steps: int,
         f"## Current state — step {step_index + 1} of {max_steps}",
     ]
     if not vision_only:
-        # The live URL is the only non-visual page-state field given to the
-        # agent.  Gold steps/criteria and other task metadata stay hidden.
+        # The live URL is the only non-visual page-state field exposed.
         lines += ["", f"URL: {state.url}"]
     if notices:
         lines += ["", "Notices:"]
         lines += [f"- {notice}" for notice in notices]
-    lines += ["", "The screenshot of the current viewport is attached. "
-                  "Decide the next action."]
+    lines += [
+        "",
+        (
+            "The screenshot of the current viewport is attached. "
+            "Decide the next action."
+        ),
+    ]
     return "\n".join(lines)
 
 

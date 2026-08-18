@@ -13,8 +13,8 @@ import logging
 
 import httpx
 
-from .config import BrowserSettings
-from .types import PageState
+from ..core.config import BrowserSettings
+from ..core.models import PageState
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +38,14 @@ class ServicePool:
             limits=httpx.Limits(max_connections=256, max_keepalive_connections=64),
         )
 
-    async def open_session(self) -> "BrowserSession":
+    async def open_session(self, *, avoid_host: str | None = None) -> BrowserSession:
+        """Open a session, avoiding a failed worker when alternatives exist."""
         host = next(self._hosts)
+        if avoid_host and len(set(self.settings.service_hosts)) > 1:
+            for _ in range(len(self.settings.service_hosts) - 1):
+                if host != avoid_host:
+                    break
+                host = next(self._hosts)
         payload = {
             "width": self.settings.viewport_width,
             "height": self.settings.viewport_height,
@@ -82,12 +88,18 @@ class BrowserSession:
         self._settings = settings
         self.viewport = (settings.viewport_width, settings.viewport_height)
 
+    @property
+    def service_host(self) -> str:
+        return self._host
+
     async def _post(self, path: str, payload: dict | None = None) -> dict:
         url = f"{self._host}/session/{self._id}{path}"
         try:
             response = await self._client.post(url, json=payload or {})
         except httpx.HTTPError as err:
-            raise BrowserGone(f"browser service unreachable: {err!r}") from err
+            raise BrowserGone(
+                f"browser service request {path} failed: {err!r}"
+            ) from err
         if response.status_code == 410:
             raise BrowserGone("session expired on the service")
         return _expect_json(response)
@@ -130,7 +142,17 @@ class BrowserSession:
                 viewport.get("width", self.viewport[0]),
                 viewport.get("height", self.viewport[1]),
             ),
+            http_status=(
+                int(data["http_status"])
+                if isinstance(data.get("http_status"), (int, float))
+                else None
+            ),
             errors=errors,
+            snapshot_meta={
+                "capture": data.get("screenshot_note"),
+                "degraded": bool(data.get("snapshot_degraded")),
+                "stage_ms": data.get("snapshot_stage_ms") or {},
+            },
         )
 
     async def act(self, command: dict) -> dict:
@@ -140,7 +162,9 @@ class BrowserSession:
     async def close(self) -> None:
         url = f"{self._host}/session/{self._id}"
         try:
-            await self._client.delete(url)
+            # Cleanup must never inherit the long browser-operation timeout: a
+            # wedged session is exactly when this method is most often called.
+            await self._client.delete(url, timeout=3.0)
         except httpx.HTTPError:
             logger.debug("close for session %s failed; reaper will collect it", self._id[:8])
 

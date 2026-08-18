@@ -3,20 +3,27 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .Python
+.venv/
 build/
 dist/
 
-# Collected data: trajectories, screenshots, HTML, api logs, run configs (these
-# contain API keys and machine paths — never commit)
+# Local credentials and machine-specific overrides
+.env
+.env.*
+
+# Local datasets and generated artifacts
 runs/
-api_logs*/
-api_calls.jsonl
+tasks/
+trajectories/
+docs/
+tests/
 
 # Node
 node_modules/
 
 # Browser service runtime logs
 browser_service/logs/
+browser_service/logs-*/
 
 # OS / editor
 .DS_Store

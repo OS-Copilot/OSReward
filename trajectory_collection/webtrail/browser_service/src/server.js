@@ -22,7 +22,14 @@ import crypto from "crypto";
 import { chromium } from "playwright-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 
-chromium.use(StealthPlugin());
+const stealth = StealthPlugin();
+// This evasion proxies iframe.contentWindow by monkey-patching
+// document.createElement.  Some real sites (notably Lawyerist) use iframe
+// measurements during layout; the proxy makes their code set body width to
+// 4000px inside a 1920px viewport, shifting most visible content off-screen.
+// Keep every other stealth evasion while preserving native iframe geometry.
+stealth.enabledEvasions.delete("iframe.contentWindow");
+chromium.use(stealth);
 
 // A single stray async rejection — most often a CDP or Playwright call landing
 // after its page closed — must never take down the whole worker and every
@@ -42,6 +49,12 @@ const DEFAULTS = {
   height: 1080,
   navTimeoutMs: 45_000,
   actTimeoutMs: 15_000,
+  snapshotTimeoutMs: 45_000,
+  domCollectTimeoutMs: 8_000,
+  axtreeTimeoutMs: 8_000,
+  cdpScreenshotTimeoutMs: 8_000,
+  playwrightScreenshotTimeoutMs: 12_000,
+  titleTimeoutMs: 2_000,
   settleMs: 800,
   netIdleMs: 2_500,
   htmlMaxBytes: 3_000_000,
@@ -52,6 +65,20 @@ const DEFAULTS = {
   dragSteps: 16,
   maxWaitMs: 8_000,
 };
+
+function withDeadline(promise, timeoutMs, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`${label} timed out after ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+  });
+  // Promise.race attaches rejection handlers to every input, so a Playwright
+  // operation rejecting after the deadline cannot become an unhandled
+  // rejection. Playwright does not expose cancellation for these calls.
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
 
 // ---------------------------------------------------------------------------
 // session registry
@@ -76,10 +103,35 @@ class Session {
     this.lastUsed = Date.now();
     this.closing = false;
     this.cdp = null; // lazily attached, used for the accessibility tree
+    this.mainDocumentStatus = null;
+    this.mainDocumentUrl = null;
   }
 
   touch() {
     this.lastUsed = Date.now();
+  }
+
+  recordMainDocumentResponse(url, status) {
+    this.mainDocumentUrl = url || null;
+    this.mainDocumentStatus = Number.isInteger(status) ? status : null;
+  }
+
+  clearMainDocumentResponse() {
+    this.mainDocumentUrl = null;
+    this.mainDocumentStatus = null;
+  }
+
+  currentHttpStatus() {
+    if (!this.mainDocumentUrl || this.mainDocumentStatus === null) return null;
+    try {
+      const current = new URL(this.page.url());
+      const observed = new URL(this.mainDocumentUrl);
+      current.hash = "";
+      observed.hash = "";
+      return current.href === observed.href ? this.mainDocumentStatus : null;
+    } catch {
+      return null;
+    }
   }
 
   async dispose() {
@@ -105,11 +157,11 @@ function launchArgs() {
   if (process.platform === "linux" && process.env.WEBTRAIL_SANDBOX !== "1") {
     args.push("--no-sandbox", "--disable-setuid-sandbox");
   }
-  // headless GPU stack is frequently absent on servers; software rendering is
-  // more reliable for screenshots
-  if (process.platform === "linux") {
-    args.push("--disable-gpu", "--disable-software-rasterizer");
-  }
+  // Do not disable both GPU compositing and Chromium's software rasterizer.
+  // Headless Chromium automatically chooses an available GPU or its software
+  // fallback; disabling both made renderer/compositor screenshot stalls much
+  // more likely on GPU-less collection hosts. Operators can still supply a
+  // host-specific GL backend through WEBTRAIL_CHROMIUM_ARGS.
   if (process.env.WEBTRAIL_CHROMIUM_ARGS) {
     args.push(...process.env.WEBTRAIL_CHROMIUM_ARGS.split(/\s+/).filter(Boolean));
   }
@@ -208,6 +260,17 @@ async function createSession(opts) {
     page,
     ownsBrowser,
     viewport: { width, height },
+  });
+  page.on("response", (response) => {
+    try {
+      if (response.frame() === page.mainFrame() &&
+          response.request().isNavigationRequest()) {
+        session.recordMainDocumentResponse(response.url(), response.status());
+      }
+    } catch {
+      // The page may close while an event is being delivered. The next
+      // snapshot will simply carry a null status instead of stale metadata.
+    }
   });
   REGISTRY.set(session.id, session);
   return session;
@@ -360,16 +423,103 @@ async function takeSnapshot(session, opts) {
 
   const result = {
     url: page.url(),
+    http_status: session.currentHttpStatus(),
     viewport: session.viewport,
     taken_at: Date.now(),
+    snapshot_stage_ms: {},
   };
+
+  const stage = async (name, promise, timeoutMs) => {
+    const startedAt = Date.now();
+    try {
+      return await withDeadline(promise, timeoutMs, name);
+    } finally {
+      result.snapshot_stage_ms[name] = Date.now() - startedAt;
+    }
+  };
+
+  // Capture the viewport before DOM/AX extraction. CDP does not wait for web
+  // fonts or animation stability, avoiding Playwright's most common screenshot
+  // stall. A dedicated CDP session isolates capture from a stuck AX request.
+  if (want.screenshot) {
+    let cdp;
+    let cdpError;
+    try {
+      cdp = await stage(
+        "cdp_attach",
+        session.context.newCDPSession(page),
+        2_000,
+      );
+      const shot = await stage(
+        "cdp_screenshot",
+        cdp.send("Page.captureScreenshot", {
+          format: "png",
+          fromSurface: true,
+          captureBeyondViewport: false,
+        }),
+        opts.cdpScreenshotTimeoutMs ?? DEFAULTS.cdpScreenshotTimeoutMs,
+      );
+      result.screenshot = shot.data;
+      result.screenshot_note = "cdp_viewport";
+    } catch (err) {
+      cdpError = err;
+    } finally {
+      if (cdp) cdp.detach().catch(() => {});
+    }
+
+    if (!result.screenshot) {
+      try {
+        const buffer = await stage(
+          "playwright_screenshot",
+          page.screenshot({
+            type: "png",
+            timeout: opts.screenshotTimeoutMs
+              ?? DEFAULTS.playwrightScreenshotTimeoutMs,
+            animations: "disabled",
+          }),
+          (opts.screenshotTimeoutMs ?? DEFAULTS.playwrightScreenshotTimeoutMs) + 1_000,
+        );
+        result.screenshot = buffer.toString("base64");
+        result.screenshot_note = "playwright_fallback";
+        // The primary compositor path was unhealthy. Return the useful image
+        // without risking another long DOM/AX call on the same renderer.
+        result.snapshot_degraded = true;
+      } catch (err) {
+        result.screenshot = null;
+        result.screenshot_error = [
+          `cdp: ${String(cdpError && cdpError.message || cdpError)}`,
+          `playwright: ${String(err && err.message || err)}`,
+        ].join("; ");
+        // The collector cannot use an observation without an image and will
+        // retry it. Avoid spending more time collecting DOM/AX for this attempt.
+        return result;
+      }
+    }
+  }
+
+  if (result.snapshot_degraded) {
+    try {
+      result.title = await stage(
+        "title",
+        page.title(),
+        opts.titleTimeoutMs ?? DEFAULTS.titleTimeoutMs,
+      );
+    } catch {
+      result.title = null;
+    }
+    return result;
+  }
 
   if (want.html || want.elements) {
     try {
-      const collected = await page.evaluate(pageCollector, {
-        htmlMaxBytes: opts.htmlMaxBytes ?? DEFAULTS.htmlMaxBytes,
-        maxElements: opts.maxElements ?? DEFAULTS.maxElements,
-      });
+      const collected = await stage(
+        "dom_collect",
+        page.evaluate(pageCollector, {
+          htmlMaxBytes: opts.htmlMaxBytes ?? DEFAULTS.htmlMaxBytes,
+          maxElements: opts.maxElements ?? DEFAULTS.maxElements,
+        }),
+        opts.domCollectTimeoutMs ?? DEFAULTS.domCollectTimeoutMs,
+      );
       result.title = collected.title;
       result.scroll = collected.scroll;
       if (want.html) result.html = collected.html;
@@ -380,51 +530,30 @@ async function takeSnapshot(session, opts) {
   }
 
   if (result.title === undefined) {
-    try { result.title = await page.title(); } catch { result.title = null; }
+    try {
+      result.title = await stage(
+        "title",
+        page.title(),
+        opts.titleTimeoutMs ?? DEFAULTS.titleTimeoutMs,
+      );
+    } catch {
+      result.title = null;
+    }
   }
 
   if (want.axtree) {
     try {
-      result.axtree = await accessibilityTree(session);
+      result.axtree = await stage(
+        "axtree",
+        accessibilityTree(session),
+        opts.axtreeTimeoutMs ?? DEFAULTS.axtreeTimeoutMs,
+      );
     } catch (err) {
       result.axtree = null;
       result.axtree_error = String(err && err.message || err);
-      session.cdp = null; // stale after navigation-induced detach; re-attach next time
-    }
-  }
-
-  if (want.screenshot) {
-    try {
-      const buffer = await page.screenshot({
-        type: "png",
-        timeout: opts.screenshotTimeoutMs ?? DEFAULTS.actTimeoutMs,
-        animations: "disabled",
-      });
-      result.screenshot = buffer.toString("base64");
-    } catch (err) {
-      // pages with perpetual animations can stall page.screenshot; raw CDP
-      // capture does not wait for compositor stability and usually succeeds.
-      // A wedged renderer can hang CDP too, so the fallback is race-bounded.
-      try {
-        if (!session.cdp) {
-          session.cdp = await session.context.newCDPSession(page);
-        }
-        // the losing side of the race must keep a catch attached, or a late
-        // rejection (page closed after timeout) escapes as unhandledRejection
-        const cdpShot = session.cdp.send("Page.captureScreenshot", { format: "png" });
-        cdpShot.catch(() => {});
-        const shot = await Promise.race([
-          cdpShot,
-          new Promise((_, reject) => setTimeout(
-            () => reject(new Error("cdp screenshot timeout")), 8_000)),
-        ]);
-        result.screenshot = shot.data;
-        result.screenshot_note = "cdp_fallback";
-      } catch (err2) {
-        result.screenshot = null;
-        result.screenshot_error = String(err && err.message || err);
-        session.cdp = null;
-      }
+      const staleCdp = session.cdp;
+      session.cdp = null; // stale or blocked; re-attach next time
+      if (staleCdp) staleCdp.detach().catch(() => {});
     }
   }
 
@@ -517,6 +646,54 @@ function deepElementScript([x, y]) {
   return node;
 }
 
+/**
+ * Resolve a top-level screenshot coordinate to the deepest element under it.
+ * Playwright's element bounding boxes use main-frame viewport coordinates, so
+ * the same global point can be translated into each child frame without DOM
+ * selectors or model-visible element IDs.  This also works for cross-origin
+ * frames because each evaluation runs in that frame's own execution context.
+ */
+async function elementAtPagePoint(page, x, y) {
+  let frame = page.mainFrame();
+  let localX = x;
+  let localY = y;
+  let offsetX = 0;
+  let offsetY = 0;
+
+  for (let depth = 0; depth < 8; depth += 1) {
+    const handle = await frame.evaluateHandle(deepElementScript, [localX, localY]);
+    const element = handle.asElement();
+    if (!element) {
+      await handle.dispose().catch(() => {});
+      return { frame, element: null, x: localX, y: localY, offsetX, offsetY };
+    }
+
+    const tagName = await element.evaluate((node) => node.tagName).catch(() => "");
+    if (tagName !== "IFRAME" && tagName !== "FRAME") {
+      return { frame, element, x: localX, y: localY, offsetX, offsetY };
+    }
+
+    const child = await element.contentFrame().catch(() => null);
+    const box = await element.boundingBox().catch(() => null);
+    const border = await element.evaluate((node) => ({
+      left: Number(node.clientLeft) || 0,
+      top: Number(node.clientTop) || 0,
+    })).catch(() => ({ left: 0, top: 0 }));
+    if (!child || !box) {
+      return { frame, element, x: localX, y: localY, offsetX, offsetY };
+    }
+
+    await handle.dispose().catch(() => {});
+    offsetX = box.x + border.left;
+    offsetY = box.y + border.top;
+    localX = x - offsetX;
+    localY = y - offsetY;
+    frame = child;
+  }
+
+  return { frame, element: null, x: localX, y: localY, offsetX, offsetY };
+}
+
 const ACTION_HANDLERS = {
   async click(page, body) {
     const [x, y] = numberPair(body);
@@ -543,8 +720,32 @@ const ACTION_HANDLERS = {
 
   async type(page, body) {
     if (typeof body.text !== "string") throw new Error("type requires text");
-    if (Number.isFinite(Number(body.x)) && Number.isFinite(Number(body.y))) {
-      await page.mouse.click(Number(body.x), Number(body.y));
+    const hasPoint = Number.isFinite(Number(body.x)) && Number.isFinite(Number(body.y));
+    const x = hasPoint ? Number(body.x) : null;
+    const y = hasPoint ? Number(body.y) : null;
+    const readEditable = async () => page.evaluate(([px, py]) => {
+      let node = Number.isFinite(px) && Number.isFinite(py)
+        ? document.elementFromPoint(px, py)
+        : document.activeElement;
+      if (node && node.shadowRoot && Number.isFinite(px) && Number.isFinite(py)) {
+        let inner = node.shadowRoot.elementFromPoint(px, py);
+        while (inner && inner !== node) {
+          node = inner;
+          inner = node.shadowRoot ? node.shadowRoot.elementFromPoint(px, py) : null;
+        }
+      }
+      const editable = node && node.closest
+        ? node.closest('input, textarea, [contenteditable="true"]')
+        : null;
+      if (!editable) return null;
+      const isPassword = editable.tagName === "INPUT" && editable.type === "password";
+      const value = editable.isContentEditable ? editable.textContent : editable.value;
+      return { value: String(value ?? ""), is_password: isPassword };
+    }, [x, y]).catch(() => null);
+
+    const before = await readEditable();
+    if (hasPoint) {
+      await page.mouse.click(x, y);
       await page.waitForTimeout(120);
     }
     if (body.clear) {
@@ -553,6 +754,15 @@ const ACTION_HANDLERS = {
     }
     await page.keyboard.type(body.text, { delay: body.delayMs ?? DEFAULTS.typeDelayMs });
     if (body.enter) await page.keyboard.press("Enter");
+    await page.waitForTimeout(50).catch(() => {});
+
+    const after = await readEditable();
+    if (!after || after.is_password) return {};
+    const expected = body.clear ? body.text : `${before && !before.is_password ? before.value : ""}${body.text}`;
+    return {
+      actual_value: after.value,
+      value_matches: after.value === expected,
+    };
   },
 
   async press(page, body) {
@@ -582,29 +792,132 @@ const ACTION_HANDLERS = {
 
   async select(page, body) {
     const [x, y] = numberPair(body);
-    const handle = await page.evaluateHandle(deepElementScript, [x, y]);
-    const element = handle.asElement();
-    let done = false;
+    const hit = await elementAtPagePoint(page, x, y);
+    const element = hit.element;
+    if (body.label === undefined && body.value === undefined) {
+      if (element) await element.dispose().catch(() => {});
+      throw new Error("select requires the visible option label or value");
+    }
+
+    // Browser-use first handles a native <select>, matching text/value without
+    // relying on the model to know an element index.
     if (element) {
       const target = await element.evaluateHandle((node) => node.closest("select"));
       const selectEl = target.asElement();
       if (selectEl) {
-        if (body.label !== undefined) {
-          await selectEl.selectOption({ label: String(body.label) });
-        } else if (body.value !== undefined) {
-          await selectEl.selectOption(String(body.value));
-        } else if (body.index !== undefined) {
-          await selectEl.selectOption({ index: Number(body.index) });
-        } else {
-          throw new Error("select requires label, value, or index");
+        try {
+          const options = await selectEl.evaluate((select) => Array.from(select.options).map((option, index) => ({
+            index,
+            label: option.text.trim(),
+            value: option.value,
+          })));
+          const needle = String(body.label !== undefined ? body.label : body.value).trim().toLowerCase();
+          const wanted = options.find((option) =>
+            option.label.toLowerCase() === needle || option.value.toLowerCase() === needle
+          ) || null;
+          if (!wanted) {
+            return {
+              action_ok: false,
+              error: `select_failed: option not found`,
+              available_options: options.map((option) => option.label || option.value).filter(Boolean).slice(0, 50),
+            };
+          }
+          await selectEl.selectOption({ index: wanted.index });
+          const selected = await selectEl.evaluate((select) => {
+            const option = select.options[select.selectedIndex];
+            return option ? { label: option.text.trim(), value: option.value } : null;
+          });
+          if (!selected || selected.value !== wanted.value) {
+            return {
+              action_ok: false,
+              error: "select_failed: selection was reverted by the page",
+              available_options: options.map((option) => option.label || option.value).filter(Boolean).slice(0, 50),
+            };
+          }
+          return { selected_label: selected.label, selected_value: selected.value };
+        } finally {
+          await target.dispose().catch(() => {});
+          await element.dispose().catch(() => {});
         }
-        done = true;
       }
       await target.dispose().catch(() => {});
     }
-    await handle.dispose().catch(() => {});
-    // no native <select> under the point: it is a custom widget, open it
-    if (!done) await page.mouse.click(x, y);
+    if (element) await element.dispose().catch(() => {});
+
+    // ARIA/custom dropdowns are often populated only after opening.  Open the
+    // widget, wait briefly, then locate the requested visible option by text.
+    await page.mouse.click(x, y);
+    await page.waitForTimeout(300);
+    const opened = await elementAtPagePoint(page, x, y);
+    const custom = await opened.frame.evaluate(([px, py, label, value]) => {
+      const visible = (node) => {
+        const rect = node.getBoundingClientRect();
+        const style = getComputedStyle(node);
+        return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+      };
+      const atPoint = document.elementFromPoint(px, py);
+      const root = atPoint && atPoint.closest
+        ? atPoint.closest('[role="combobox"], [role="listbox"], [role="menu"], .dropdown, .ui.dropdown')
+        : null;
+      const candidates = [];
+      const add = (nodes) => {
+        for (const node of nodes || []) {
+          if (visible(node) && !candidates.includes(node)) candidates.push(node);
+        }
+      };
+      if (root) {
+        add(root.querySelectorAll('[role="option"], [role="menuitem"], .option, .item, [data-value]'));
+        const controlledId = root.getAttribute("aria-controls") || root.getAttribute("aria-owns");
+        if (controlledId) {
+          const controlled = document.getElementById(controlledId);
+          if (controlled) add(controlled.querySelectorAll('[role="option"], [role="menuitem"], .option, .item, [data-value]'));
+        }
+      }
+      add(document.querySelectorAll(
+        '[role="listbox"] [role="option"], [role="menu"] [role="menuitem"], '
+        + '.dropdown.visible .item, .dropdown.active .item, .menu.visible .item'
+      ));
+
+      const describe = (node) => ({
+        label: String(node.textContent || node.getAttribute("aria-label") || "").trim(),
+        value: String(node.getAttribute("data-value") || node.getAttribute("value") || "").trim(),
+      });
+      const available = candidates.map(describe).filter((item) => item.label || item.value);
+      const needle = String(label !== null && label !== undefined ? label : value).trim().toLowerCase();
+      const chosen = candidates.find((node) => {
+        const item = describe(node);
+        return item.label.toLowerCase() === needle || item.value.toLowerCase() === needle;
+      }) || null;
+      if (!chosen) {
+        return {
+          found: false,
+          available_options: available.map((item) => item.label || item.value).slice(0, 50),
+        };
+      }
+      const rect = chosen.getBoundingClientRect();
+      const item = describe(chosen);
+      return {
+        found: true,
+        x: rect.left + rect.width / 2,
+        y: rect.top + rect.height / 2,
+        label: item.label,
+        value: item.value,
+      };
+    }, [opened.x, opened.y, body.label ?? null, body.value ?? null]);
+    if (opened.element) await opened.element.dispose().catch(() => {});
+
+    if (!custom.found) {
+      return {
+        action_ok: false,
+        error: "select_failed: requested option was not found in the opened dropdown",
+        available_options: custom.available_options || [],
+      };
+    }
+    await page.mouse.click(opened.offsetX + custom.x, opened.offsetY + custom.y);
+    return {
+      selected_label: custom.label,
+      selected_value: custom.value,
+    };
   },
 
   async check(page, body) {
@@ -628,11 +941,35 @@ const ACTION_HANDLERS = {
   },
 
   async back(page) {
-    await page.goBack({ waitUntil: "domcontentloaded" }).catch(() => {});
+    const before = page.url();
+    try {
+      const response = await page.goBack({ waitUntil: "domcontentloaded" });
+      if (!response && page.url() === before) {
+        return { action_ok: false, error: "back_failed: browser history did not change" };
+      }
+      return { status: response ? response.status() : null };
+    } catch (err) {
+      if (page.url() === before) {
+        return { action_ok: false, error: `back_failed: ${err.message || err}` };
+      }
+      return { status: null, navigation_warning: String(err.message || err) };
+    }
   },
 
   async forward(page) {
-    await page.goForward({ waitUntil: "domcontentloaded" }).catch(() => {});
+    const before = page.url();
+    try {
+      const response = await page.goForward({ waitUntil: "domcontentloaded" });
+      if (!response && page.url() === before) {
+        return { action_ok: false, error: "forward_failed: browser history did not change" };
+      }
+      return { status: response ? response.status() : null };
+    } catch (err) {
+      if (page.url() === before) {
+        return { action_ok: false, error: `forward_failed: ${err.message || err}` };
+      }
+      return { status: null, navigation_warning: String(err.message || err) };
+    }
   },
 
   async wait(page, body) {
@@ -695,10 +1032,14 @@ app.post("/session/:id/goto", async (req, res) => {
     return res.json({ ok: false, error: `goto_failed: unresolvable url ${url}` });
   }
   try {
+    session.clearMainDocumentResponse();
     const response = await session.page.goto(url, {
       timeout: timeoutMs || DEFAULTS.navTimeoutMs,
       waitUntil: waitUntil || "domcontentloaded",
     });
+    if (response) {
+      session.recordMainDocumentResponse(response.url(), response.status());
+    }
     res.json({
       ok: true,
       status: response ? response.status() : null,
@@ -713,10 +1054,23 @@ app.post("/session/:id/snapshot", async (req, res) => {
   const session = getSession(req, res);
   if (!session) return;
   try {
-    const snapshot = await takeSnapshot(session, req.body || {});
+    const body = req.body || {};
+    const requested = Number(body.snapshotTimeoutMs);
+    const timeoutMs = Number.isFinite(requested)
+      ? Math.min(Math.max(requested, 5_000), DEFAULTS.snapshotTimeoutMs)
+      : DEFAULTS.snapshotTimeoutMs;
+    const snapshot = await withDeadline(
+      takeSnapshot(session, body),
+      timeoutMs,
+      "snapshot",
+    );
     res.json({ ok: true, ...snapshot });
   } catch (err) {
-    res.status(500).json({ ok: false, error: `snapshot_failed: ${err.message || err}` });
+    const timedOut = String(err && err.message || err).includes("timed out");
+    res.status(timedOut ? 504 : 500).json({
+      ok: false,
+      error: `snapshot_failed: ${err.message || err}`,
+    });
   }
 });
 
@@ -730,12 +1084,29 @@ app.post("/session/:id/act", async (req, res) => {
   }
   const startedAt = Date.now();
   try {
-    await handler(session.page, body);
-    res.json({ ok: true, elapsed_ms: Date.now() - startedAt, final_url: safeUrl(session) });
+    const actionResult = await handler(session.page, body);
+    if (actionResult && actionResult.action_ok === false) {
+      const { action_ok: _actionOk, ...details } = actionResult;
+      return res.json({
+        ok: false,
+        ...details,
+        http_status: session.currentHttpStatus(),
+        elapsed_ms: Date.now() - startedAt,
+        final_url: safeUrl(session),
+      });
+    }
+    res.json({
+      ok: true,
+      ...(actionResult || {}),
+      http_status: session.currentHttpStatus(),
+      elapsed_ms: Date.now() - startedAt,
+      final_url: safeUrl(session),
+    });
   } catch (err) {
     res.json({
       ok: false,
       error: `${body.kind}_failed: ${err.message || err}`,
+      http_status: session.currentHttpStatus(),
       elapsed_ms: Date.now() - startedAt,
       final_url: safeUrl(session),
     });

@@ -23,7 +23,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
-from .config import PacingSettings
+from ..core.config import PacingSettings
 
 
 class DomainCoolingDown(Exception):
