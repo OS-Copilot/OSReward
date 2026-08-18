@@ -16,11 +16,16 @@ the model as a corrective turn, so the wording is written for the model.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
-from .grounding import GroundingContext, GroundingError, resolve_optional_target, resolve_target
-from .types import CompiledAction, ParsedAction
+from ..core.models import CompiledAction, ParsedAction
+from .grounding import (
+    GroundingContext,
+    GroundingError,
+    resolve_optional_target,
+    resolve_target,
+)
 
 
 class ActionError(ValueError):
@@ -198,10 +203,11 @@ def _select_option(args: dict, ctx: GroundingContext) -> CompiledAction:
         command["label"] = str(args["label"])
     elif "value" in args:
         command["value"] = str(args["value"])
-    elif "index" in args:
-        command["index"] = args["index"]
     else:
-        raise ActionError("`select_option` needs `label` (visible option text)")
+        raise ActionError(
+            "`select_option` needs `label` (visible option text); element IDs and "
+            "option indices are not supported"
+        )
     return CompiledAction(
         key="select_option", commands=[command],
         point=(target.x, target.y), box_px=target.box_px,
@@ -273,7 +279,9 @@ _SPECS: dict[str, ActionSpec] = {
             'what was accomplished. Use it as soon as the task is complete or clearly impossible.'
         ), _stop),
         ActionSpec("goto", _doc(
-            '- `goto` — navigate to a URL. args: "url".'
+            '- `goto` — navigate only to an exact URL already provided or visibly observed. '
+            'args: "url". Never guess paths, article slugs, filenames, query strings, or '
+            'filter parameters; click visible links and search results instead.'
         ), _goto),
         ActionSpec("go_back", _doc(
             '- `go_back` — browser history back. args: none.'

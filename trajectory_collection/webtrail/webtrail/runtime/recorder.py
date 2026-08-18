@@ -5,7 +5,6 @@ files named by step so each folder browses as a flat sequence)::
 
     <out_dir>/
       run_config.json
-      api_calls.jsonl                  # model-call latency/usage log
       rejects.jsonl                    # tasks that never produced a trajectory
       trajectories/<task_id>/
         task.json
@@ -13,10 +12,10 @@ files named by step so each folder browses as a flat sequence)::
         judge.json                     # written later by `webtrail judge`
         screenshots/step_000.png       # what the browser rendered
         model_views/step_000.png       # optional resized copy sent to the model
-        annotated/step_000.png         # optional executed-action visualization
+        annotated/step_000.png         # optional action annotation
         html/step_000.html             # optional raw page HTML
         axtree/step_000.json           # optional accessibility tree
-        elements/step_000.json
+        elements/step_000.json          # optional DOM-derived debug artifact
         states/step_000.json           # url/title/scroll/hashes/guard verdict
         agent/step_000.json            # raw reply, parsed action, resolved
                                        # target, commands, usage, latency
@@ -28,14 +27,15 @@ files named by step so each folder browses as a flat sequence)::
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import time
 from pathlib import Path
 
 from PIL import ImageDraw
 
-from . import imutil
-from .types import CompiledAction, PageState, Task
+from ..browser import images
+from ..core.models import CompiledAction, PageState, Task
 
 FINAL_STATUSES = {"completed", "max_steps", "blocked", "env_error",
                   "stale_loop", "agent_error"}
@@ -49,26 +49,37 @@ def _write_json(path: Path, data) -> None:
 
 
 class RunRecorder:
-    """Run-level files: config snapshot, rejects, api log path."""
+    """Run-level files: configuration snapshot and rejected tasks."""
 
     def __init__(self, out_dir: str | Path, *, save_html: bool = False,
-                 save_axtree: bool = False, save_model_views: bool = False):
+                 save_axtree: bool = False, save_elements: bool = False,
+                 save_model_views: bool = False):
         self.root = Path(out_dir)
         self.trajectories = self.root / "trajectories"
         self.trajectories.mkdir(parents=True, exist_ok=True)
         self._reject_lock = asyncio.Lock()
         self._save_html = save_html
         self._save_axtree = save_axtree
+        self._save_elements = save_elements
         self._save_model_views = save_model_views
 
-    @property
-    def api_log_path(self) -> Path:
-        return self.root / "api_calls.jsonl"
-
     def save_config(self, config_dict: dict) -> None:
+        saved_config = copy.deepcopy(config_dict)
+        # Keep run artifacts shareable: endpoint overrides and proxy credentials
+        # are operational details, not trajectory data.
+        for section_name in ("model", "judge"):
+            section = saved_config.get(section_name)
+            if isinstance(section, dict) and section.get("base_url"):
+                section["base_url"] = "<configured>"
+        browser = saved_config.get("browser")
+        proxy = browser.get("proxy") if isinstance(browser, dict) else None
+        if isinstance(proxy, dict):
+            for key in ("server", "username", "password"):
+                if proxy.get(key):
+                    proxy[key] = ("<configured>" if key == "server" else "<redacted>")
         _write_json(self.root / "run_config.json", {
             "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            **config_dict,
+            **saved_config,
         })
 
     async def reject(self, task: Task, reason: str, detail: str = "") -> None:
@@ -95,12 +106,13 @@ class RunRecorder:
         except (ValueError, OSError):
             return False
 
-    def open_trajectory(self, task: Task) -> "TrajectoryRecorder":
+    def open_trajectory(self, task: Task) -> TrajectoryRecorder:
         return TrajectoryRecorder(
             self.trajectories / task.task_id,
             task,
             save_html=self._save_html,
             save_axtree=self._save_axtree,
+            save_elements=self._save_elements,
             save_model_views=self._save_model_views,
         )
 
@@ -112,10 +124,12 @@ def step_file(traj_dir: Path, kind: str, index: int, suffix: str) -> Path:
 
 class TrajectoryRecorder:
     def __init__(self, root: Path, task: Task, *, save_html: bool = False,
-                 save_axtree: bool = False, save_model_views: bool = False):
+                 save_axtree: bool = False, save_elements: bool = False,
+                 save_model_views: bool = False):
         self.root = root
         self._save_html = save_html
         self._save_axtree = save_axtree
+        self._save_elements = save_elements
         self._save_model_views = save_model_views
         root.mkdir(parents=True, exist_ok=True)
         self.started_at = time.time()
@@ -144,21 +158,23 @@ class TrajectoryRecorder:
                 state.html, encoding="utf-8", errors="replace")
         if self._save_axtree and state.axtree is not None:
             _write_json(self._file("axtree", index, ".json"), state.axtree)
-        if state.elements is not None:
+        if self._save_elements and state.elements is not None:
             _write_json(self._file("elements", index, ".json"), state.elements)
 
         shot_hash = None
         if state.screenshot_png:
-            shot_hash = f"{imutil.dhash(imutil.load_png(state.screenshot_png)):016x}"
+            shot_hash = f"{images.dhash(images.load_png(state.screenshot_png)):016x}"
         _write_json(self._file("states", index, ".json"), {
             "url": state.url,
             "title": state.title,
+            "http_status": state.http_status,
             "scroll": state.scroll,
             "viewport": list(state.viewport),
             "html_bytes": len(state.html or ""),
             "num_elements": len(state.elements or []),
             "screenshot_dhash": shot_hash,
             "observation_errors": state.errors,
+            "snapshot": state.snapshot_meta,
             "guard": {
                 "kind": verdict.kind,
                 "scope": verdict.scope,
@@ -200,7 +216,7 @@ class TrajectoryRecorder:
         """Draw the executed action (box, point, drag arrow) onto a copy."""
         if not (compiled.point or compiled.box_px):
             return
-        image = imutil.load_png(screenshot_png)
+        image = images.load_png(screenshot_png)
         draw = ImageDraw.Draw(image)
         color = (255, 40, 40)
         if compiled.box_px:
@@ -221,7 +237,7 @@ class TrajectoryRecorder:
             draw.ellipse([dx - 5, dy - 5, dx + 5, dy + 5], fill=color)
         label = compiled.key + (f" {compiled.point}" if compiled.point else "")
         draw.text((8, 8), label, fill=color)
-        self._file("annotated", index, ".png").write_bytes(imutil.to_png_bytes(image))
+        self._file("annotated", index, ".png").write_bytes(images.to_png_bytes(image))
 
     def save_result(self, task: Task, *, status: str, steps_taken: int,
                     final_url: str | None, stop_answer: str | None,

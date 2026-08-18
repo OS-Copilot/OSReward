@@ -1,30 +1,34 @@
 """The browsing agent: context management, model calls, response parsing.
 
-`WebAgent` is instantiated once per episode. It keeps the turn history, builds
-messages according to the configured history mode, calls the model, and parses
-the reply into a `ParsedAction`. Malformed replies trigger a corrective
+`WebAgent` is instantiated once per episode. It keeps a semantic turn history,
+builds messages according to the configured history mode, calls the model, and
+parses the reply into a `ParsedAction`. Malformed replies trigger a corrective
 re-ask (bounded by ``run.parse_retries``).
 
 History modes
 -------------
-* ``windowed``  – the last N steps are kept verbatim (screenshot + reply);
-                  older steps collapse into one-line summaries.
+* ``windowed``  – the last N steps keep the model reply and browser action
+                  result; older steps collapse into one-line summaries.
 * ``text_full`` – every past analysis/action is kept as plain text in a single
-                  context message, and only the newest screenshot is attached.
+                  context message.
+
+Both modes attach exactly one browser image: the current screenshot.  DOM,
+HTML, accessibility trees, and element IDs are never serialized here.
 """
 
 from __future__ import annotations
 
 import base64
+import copy
 import json
 import re
 from dataclasses import dataclass, field
 
+from ..browser.grounding import GroundingContext
+from ..core.config import ModelSettings, RunSettings
+from ..core.models import PageState, ParsedAction, Task
 from . import prompts
-from .config import ModelSettings, RunSettings
-from .grounding import GroundingContext
 from .llm import ChatModel, ChatReply
-from .types import PageState, ParsedAction, Task
 
 
 class AgentFormatError(Exception):
@@ -95,6 +99,8 @@ class Turn:
     reply_text: str = ""
     action_key: str | None = None
     action_args: dict | None = None
+    action_results: list[dict] = field(default_factory=list)
+    post_url: str | None = None
 
 
 @dataclass
@@ -125,46 +131,87 @@ class WebAgent:
     def _image_part(data_url: str) -> dict:
         return {"type": "image_url", "image_url": {"url": data_url}}
 
+    @staticmethod
+    def _safe_result(result: dict) -> str:
+        """Render one browser result without leaking internal page structures."""
+        if result.get("ok"):
+            status = "success"
+        else:
+            status = "failure"
+
+        details = []
+        if result.get("error"):
+            details.append(f"error={str(result['error'])[:300]}")
+        if result.get("final_url"):
+            details.append(f"final_url={result['final_url']}")
+        if result.get("selected_label") is not None:
+            details.append(f"selected_label={result['selected_label']!r}")
+        if result.get("selected_value") is not None:
+            details.append(f"selected_value={result['selected_value']!r}")
+        if result.get("actual_value") is not None:
+            details.append(f"actual_value={result['actual_value']!r}")
+        if result.get("value_matches") is not None:
+            details.append(f"value_matches={bool(result['value_matches'])}")
+        if result.get("available_options"):
+            options = [str(option)[:100] for option in result["available_options"][:30]]
+            details.append(f"available_options={options!r}")
+        rendered = "; ".join(details)
+        return f"{status}: {rendered}" if rendered else status
+
+    @classmethod
+    def _turn_history(cls, turn: Turn, *, detailed: bool) -> str:
+        header = f"### Step {turn.step_index + 1} @ {turn.url}"
+        if detailed:
+            action = turn.reply_text.strip() or "(no model reply recorded)"
+        else:
+            args = {k: v for k, v in (turn.action_args or {}).items()
+                    if k != "analysis"}
+            action = (f"Action: {turn.action_key} {args}" if turn.action_key
+                      else "Action: (none)")
+
+        if turn.action_results:
+            results = "\n".join(
+                f"Action Result {index + 1}: {cls._safe_result(result)}"
+                for index, result in enumerate(turn.action_results)
+            )
+        elif turn.action_key == "stop":
+            results = "Action Result: no browser command required"
+        else:
+            results = "Action Result: unavailable"
+        post_url = f"\nPost-action URL: {turn.post_url}" if turn.post_url else ""
+        return f"{header}\n{action}\n{results}{post_url}"
+
+    def _history_message(self, turns: list[Turn], *, detailed_from: int) -> dict:
+        blocks = [
+            self._turn_history(turn, detailed=index >= detailed_from)
+            for index, turn in enumerate(turns)
+        ]
+        return {
+            "role": "user",
+            "content": (
+                "Agent history (oldest first). Action Result reports whether the "
+                "browser command executed; use the current screenshot as ground truth "
+                "for whether the task actually progressed.\n\n" + "\n\n".join(blocks)
+            ),
+        }
+
     def _windowed_messages(self, current: Turn) -> list[dict]:
         window = max(1, self.model_settings.history_window)
-        older = self.turns[:-(window - 1)] if window > 1 else self.turns
-        recent = self.turns[len(older):]
-
         messages: list[dict] = [{"role": "system", "content": self.system}]
-        if older:
-            summary = "\n".join(
-                prompts.history_line(t.step_index, t.action_key, t.action_args, t.url)
-                for t in older
-            )
-            messages.append({
-                "role": "user",
-                "content": "Summary of earlier steps (screenshots omitted):\n" + summary,
-            })
-            messages.append({
-                "role": "assistant",
-                "content": "Understood. Continuing from there.",
-            })
-        for turn in recent:
-            messages.append(self._turn_user_message(turn))
-            messages.append({"role": "assistant", "content": turn.reply_text})
+        if self.turns:
+            detailed_from = max(0, len(self.turns) - window)
+            messages.append(self._history_message(self.turns, detailed_from=detailed_from))
+            messages.append({"role": "assistant",
+                             "content": "Understood. I will use the current screenshot as ground truth."})
         messages.append(self._turn_user_message(current))
         return messages
 
     def _text_full_messages(self, current: Turn) -> list[dict]:
         messages: list[dict] = [{"role": "system", "content": self.system}]
         if self.turns:
-            blocks = []
-            for turn in self.turns:
-                blocks.append(f"### Step {turn.step_index + 1} — {turn.url}\n"
-                              f"{turn.reply_text.strip()}")
-            messages.append({
-                "role": "user",
-                "content": ("Full history of your previous analyses and actions "
-                            "(oldest first). Only the newest screenshot is "
-                            "attached to the next message.\n\n" + "\n\n".join(blocks)),
-            })
+            messages.append(self._history_message(self.turns, detailed_from=0))
             messages.append({"role": "assistant",
-                             "content": "Understood. Continuing from there."})
+                             "content": "Understood. I will use the current screenshot as ground truth."})
         messages.append(self._turn_user_message(current))
         return messages
 
@@ -244,6 +291,15 @@ class WebAgent:
             )
 
         raise AgentFormatError(f"unparseable model output after retries: {parse_error}")
+
+    def record_action_result(self, step_index: int, results: list[dict],
+                             post_url: str | None = None) -> None:
+        """Attach browser-use-style action results to the completed model turn."""
+        if not self.turns or self.turns[-1].step_index != step_index:
+            raise RuntimeError(f"cannot attach action result for missing step {step_index}")
+        turn = self.turns[-1]
+        turn.action_results = copy.deepcopy(results)
+        turn.post_url = post_url
 
     def record_notice_only(self) -> None:
         """Forget the pending turn (used when the episode aborts before acting)."""

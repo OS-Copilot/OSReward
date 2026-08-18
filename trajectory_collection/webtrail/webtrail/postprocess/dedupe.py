@@ -20,8 +20,8 @@ import re
 from pathlib import Path
 from urllib.parse import urlparse
 
-from .. import imutil
-from ..types import domain_of
+from ..browser import images
+from ..core.models import domain_of
 from .buckets import Triage
 
 _NORM_RE = re.compile(r"[^a-z0-9 ]+")
@@ -43,7 +43,7 @@ def _final_screenshot_hash(traj_dir: Path, steps_taken: int) -> int | None:
         path = traj_dir / "screenshots" / f"step_{index:03d}.png"
         if path.exists():
             try:
-                return imutil.dhash(imutil.load_png(path.read_bytes()))
+                return images.dhash(images.load_png(path.read_bytes()))
             except OSError:
                 return None
     return None
@@ -88,7 +88,7 @@ def mark_duplicates(run_dir: Path, triages: list[Triage],
                 if shot_hash is None or kept_hash is None:
                     duplicate_of = kept_triage      # identical keys, no image to differ
                     break
-                if imutil.hamming(shot_hash, kept_hash) <= hamming_threshold:
+                if images.hamming(shot_hash, kept_hash) <= hamming_threshold:
                     duplicate_of = kept_triage
                     break
             if duplicate_of is None:

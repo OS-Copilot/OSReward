@@ -34,8 +34,9 @@ import statistics
 import time
 from pathlib import Path
 
-from .config import ModelSettings
-from .llm import ChatModel, LLMError
+from ..agents.llm import ChatModel, LLMError
+from ..browser import images
+from ..core.config import ModelSettings
 
 logger = logging.getLogger(__name__)
 
@@ -249,7 +250,30 @@ def _step_records(traj_dir: Path) -> list[dict]:
     return records
 
 
-def build_messages(traj_dir: Path, last_n: int, style: str = "binary") -> list[dict]:
+def _image_data_url(path: Path, settings: ModelSettings | None) -> str:
+    image_format = (settings.image_format if settings else "png").lower()
+    max_side = settings.image_max_side if settings else 0
+    jpeg_quality = settings.image_jpeg_quality if settings else 85
+
+    if image_format == "png" and max_side <= 0:
+        payload = path.read_bytes()
+        media_type = "image/png"
+    else:
+        image = images.fit_max_side(images.load_png(path.read_bytes()), max_side)
+        if image_format == "jpeg":
+            payload = images.to_jpeg_bytes(image, jpeg_quality)
+            media_type = "image/jpeg"
+        elif image_format == "png":
+            payload = images.to_png_bytes(image)
+            media_type = "image/png"
+        else:
+            raise ValueError(f"unsupported judge image format: {image_format}")
+    encoded = base64.b64encode(payload).decode()
+    return f"data:{media_type};base64,{encoded}"
+
+
+def build_messages(traj_dir: Path, last_n: int, style: str = "binary",
+                   settings: ModelSettings | None = None) -> list[dict]:
     task = json.loads((traj_dir / "task.json").read_text())
     result = json.loads((traj_dir / "result.json").read_text())
     steps = _step_records(traj_dir)
@@ -258,9 +282,10 @@ def build_messages(traj_dir: Path, last_n: int, style: str = "binary") -> list[d
     content: list[dict] = []
     for rec in selected:
         if rec["shot"] is not None:
-            encoded = base64.b64encode(rec["shot"].read_bytes()).decode()
             content.append({"type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{encoded}"}})
+                            "image_url": {
+                                "url": _image_data_url(rec["shot"], settings)
+                            }})
 
     history = "\n".join(
         f"Step {r['idx'] + 1} @ {r['url'][:90]}: {r['action']} "
@@ -269,8 +294,10 @@ def build_messages(traj_dir: Path, last_n: int, style: str = "binary") -> list[d
     ) or "(no actions recorded)"
 
     lines = [
-        f"The screenshots of the last {len(selected)} states are provided above, "
-        "oldest first; a click target may be circled in red.",
+        (
+            f"The screenshots of the last {len(selected)} states are provided above, "
+            "oldest first; a click target may be circled in red."
+        ),
         "",
         f"User instruction: {task['instruction']}",
     ]
@@ -296,12 +323,12 @@ def build_messages(traj_dir: Path, last_n: int, style: str = "binary") -> list[d
 async def judge_trajectory(model: ChatModel, traj_dir: Path, last_n: int,
                            retries: int = 1, votes: int = 1,
                            style: str = "binary") -> dict:
-    messages = build_messages(traj_dir, last_n, style)
+    messages = build_messages(traj_dir, last_n, style, model.settings)
     started = time.time()
     ballots: list[dict] = []
-    for _ in range(max(1, votes)):
+    for vote_index in range(max(1, votes)):
         last_error = None
-        for _ in range(retries + 1):
+        for parse_attempt in range(retries + 1):
             reply = await model.complete(messages)
             try:
                 if style == "multi":
@@ -352,21 +379,25 @@ async def judge_trajectory(model: ChatModel, traj_dir: Path, last_n: int,
     return record
 
 
-async def judge_run(run_dir: Path, settings: ModelSettings, *,
-                    concurrency: int, last_n: int, force: bool,
-                    votes: int = 1, style: str = "binary") -> dict:
-    traj_dirs = [d for d in sorted((run_dir / "trajectories").iterdir())
-                 if (d / "result.json").exists()]
+async def judge_trajectories(traj_dirs: list[Path], settings: ModelSettings, *,
+                             concurrency: int, last_n: int, force: bool = False,
+                             votes: int = 1, style: str = "binary") -> dict:
+    """Judge an explicit, stable batch of trajectories.
+
+    Taking an explicit list prevents trajectories completed while a batch is
+    being scored from leaking into that batch. Per-trajectory ``judge.json``
+    files remain the resume checkpoint.
+    """
+    traj_dirs = [Path(d) for d in traj_dirs if (Path(d) / "result.json").exists()]
     if not force:
         traj_dirs = [d for d in traj_dirs if not (d / "judge.json").exists()]
 
-    model = ChatModel(settings, api_log_path=run_dir / "api_calls.jsonl")
-    semaphore = asyncio.Semaphore(concurrency)
+    model = ChatModel(settings)
+    semaphore = asyncio.Semaphore(max(1, concurrency))
     tally: collections.Counter[str] = collections.Counter()
-    failures = 0
+    failed_trajectory_ids: list[str] = []
 
     async def one(traj_dir: Path) -> None:
-        nonlocal failures
         async with semaphore:
             try:
                 record = await judge_trajectory(model, traj_dir, last_n,
@@ -374,7 +405,7 @@ async def judge_run(run_dir: Path, settings: ModelSettings, *,
                 tally[record["judge"]] += 1
                 logger.info("%s -> %s", traj_dir.name, record["judge"])
             except (LLMError, ValueError, OSError) as err:
-                failures += 1
+                failed_trajectory_ids.append(traj_dir.name)
                 logger.warning("judge failed for %s: %s", traj_dir.name, err)
 
     try:
@@ -387,9 +418,27 @@ async def judge_run(run_dir: Path, settings: ModelSettings, *,
         "judged": judged,
         "success": tally.get("SUCCESS", 0),
         "fail": tally.get("FAIL", 0),
-        "failures": failures,
+        "failures": len(failed_trajectory_ids),
+        "failed_trajectory_ids": sorted(failed_trajectory_ids),
         "success_rate": round(tally.get("SUCCESS", 0) / judged, 3) if judged else None,
     }
+
+
+async def judge_run(run_dir: Path, settings: ModelSettings, *,
+                    concurrency: int, last_n: int, force: bool,
+                    votes: int = 1, style: str = "binary") -> dict:
+    trajectories_dir = run_dir / "trajectories"
+    traj_dirs = [d for d in sorted(trajectories_dir.iterdir())
+                 if (d / "result.json").exists()]
+    return await judge_trajectories(
+        traj_dirs,
+        settings,
+        concurrency=concurrency,
+        last_n=last_n,
+        force=force,
+        votes=votes,
+        style=style,
+    )
 
 
 def add_parser(subparsers) -> None:
@@ -398,8 +447,13 @@ def add_parser(subparsers) -> None:
     )
     parser.add_argument("--run", required=True, help="run directory")
     parser.add_argument("--model", required=True, help="judge model id")
-    parser.add_argument("--base-url", required=True)
-    parser.add_argument("--api-key", default="")
+    parser.add_argument("--provider", choices=["auto", "openai", "anthropic"],
+                        default="auto", help="auto detects Claude model ids")
+    parser.add_argument(
+        "--base-url",
+        default="",
+        help="optional compatible API base URL; official provider API by default",
+    )
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--rubric", choices=["binary", "multi"], default="binary",
                         help="binary = SUCCESS/FAIL verdict (default); multi = the "
@@ -411,9 +465,9 @@ def add_parser(subparsers) -> None:
     parser.add_argument("--votes", type=int, default=1,
                         help="independent judge samples per trajectory; the "
                              "majority verdict is kept")
-    parser.add_argument("--temperature", type=float, default=0.1)
-    parser.add_argument("--max-tokens", type=int, default=4096,
-                        help="reasoning models may burn most of this on thinking")
+    parser.add_argument("--temperature", type=float,
+                        help="optional sampling temperature")
+    parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--force", action="store_true",
                         help="re-judge trajectories that already have judge.json")
     parser.set_defaults(handler=main)
@@ -425,7 +479,7 @@ def main(args: argparse.Namespace) -> None:
                         datefmt="%H:%M:%S")
     logging.getLogger("httpx").setLevel(logging.WARNING)
     settings = ModelSettings(
-        model=args.model, base_url=args.base_url, api_key=args.api_key,
+        provider=args.provider, model=args.model, base_url=args.base_url,
         temperature=args.temperature, max_tokens=args.max_tokens,
     )
     summary = asyncio.run(judge_run(

@@ -6,7 +6,7 @@ episode early instead of burning model calls on a CAPTCHA or a 403 page.
 
 Detected kinds:
     captcha, challenge, access_denied, rate_limit, login_wall, geo_blocked,
-    network_error, empty_page
+    not_found, server_error, network_error
 
 Each verdict also carries a scope: ``search`` when the blocked page belongs to
 a search engine (the runner may fall back to another engine) and ``target``
@@ -17,8 +17,7 @@ from __future__ import annotations
 
 import re
 
-from . import imutil
-from .types import PageState, Verdict, domain_of
+from ..core.models import PageState, Verdict, domain_of
 
 SEARCH_ENGINE_DOMAINS = {
     "google.com", "bing.com", "duckduckgo.com", "yahoo.com", "baidu.com",
@@ -35,6 +34,9 @@ _TITLE_RULES: list[tuple[str, tuple[str, ...]]] = [
                        "403 forbidden", "forbidden", "not authorized",
                        "unauthorized")),
     ("rate_limit", ("too many requests", "rate limit", "429")),
+    ("not_found", ("page not found", "404 not found", "404 |", "404 -",
+                   "error 404", "page does not exist", "page doesn't exist",
+                   "page does not seem to exist")),
     ("network_error", ("this site can", "server not found", "problem loading page",
                        "page not available", "err_", "dns_probe")),
 ]
@@ -54,6 +56,9 @@ _HTML_RULES: list[tuple[str, tuple[str, ...]]] = [
     ("access_denied", ("access denied", "you don't have permission to access",
                        "the owner of this website has banned",
                        "blocked by network security")),
+    ("not_found", ("page not found", "page you are looking for doesn't exist",
+                   "page you were trying to access is not at this address",
+                   "page does not seem to exist", "page has been moved or no longer exists")),
     ("geo_blocked", ("not available in your country",
                      "not available in your region",
                      "unavailable in your location", "451 unavailable")),
@@ -64,6 +69,7 @@ _URL_RULES: list[tuple[str, tuple[str, ...]]] = [
     ("challenge", ("/cdn-cgi/challenge", "geo.captcha-delivery.com", "validate.perfdrive")),
     ("login_wall", ("accounts.google.com/v3/signin", "login.microsoftonline",
                     "/checkpoint/challenge")),
+    ("not_found", ("/errors/404", "/404.html", "/404/")),
 ]
 
 _LOGIN_HINTS = ("sign in to continue", "log in to continue", "login to continue",
@@ -88,6 +94,30 @@ def inspect_state(state: PageState, goto_error: str | None = None) -> Verdict:
     title = (state.title or "").lower()
     html = (state.html or "").lower()
     scope = "search" if is_search_domain(state.url or "") else "target"
+
+    # Chromium's internal navigation failure page has no meaningful HTTP
+    # metadata or content. Classify it for a model-visible diagnostic; after
+    # preflight, the runner leaves this state/session intact so recovery remains
+    # an explicit agent action.
+    if url.startswith("chrome-error://"):
+        return Verdict("network_error", scope, "Chromium rendered an internal navigation error page")
+
+    # Browser response metadata is the strongest signal available. Keeping it
+    # on PageState prevents a rendered 403/404 page from being mistaken for a
+    # healthy page merely because it has working menus and a normal site title.
+    status = state.http_status
+    if status in {401, 403, 407}:
+        return Verdict("access_denied", scope, f"main document returned HTTP {status}")
+    if status in {404, 410}:
+        return Verdict("not_found", scope, f"main document returned HTTP {status}")
+    if status == 429:
+        return Verdict("rate_limit", scope, "main document returned HTTP 429")
+    if status == 451:
+        return Verdict("geo_blocked", scope, "main document returned HTTP 451")
+    if status == 406:
+        return Verdict("network_error", scope, "main document returned HTTP 406")
+    if status is not None and 500 <= status <= 599:
+        return Verdict("server_error", scope, f"main document returned HTTP {status}")
 
     if goto_error:
         lowered = goto_error.lower()
@@ -120,14 +150,9 @@ def inspect_state(state: PageState, goto_error: str | None = None) -> Verdict:
         if any(hint in html for hint in _LOGIN_HINTS):
             return Verdict("login_wall", scope, "page demands login to continue")
 
-    # empty / dead page checks
-    if url in ("", "about:blank"):
-        return Verdict("empty_page", scope, "url is about:blank")
-    if state.html is not None and text_len < 80 and interactive == 0:
-        return Verdict("empty_page", scope, f"page text is {text_len} chars with no elements")
-    if state.screenshot_png is not None:
-        image = imutil.load_png(state.screenshot_png)
-        if imutil.near_uniform(image) and interactive == 0:
-            return Verdict("empty_page", scope, "screenshot is a uniform frame")
+    # Blank or nearly uniform pages are not terminal blocks. They may be an
+    # intermediate render, a recoverable browser error, or a page the agent can
+    # leave with reload/back/goto. The runner's stale-state guard still bounds
+    # genuinely dead pages without misclassifying them as website blocking.
 
     return Verdict(None, scope, "")

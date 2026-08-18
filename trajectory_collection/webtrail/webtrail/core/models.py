@@ -19,7 +19,7 @@ def domain_of(url: str) -> str:
 
 def normalize_url(url: str) -> str:
     url = url.strip()
-    if not re.match(r"^https?://", url, re.I):
+    if not re.match(r"^https?://", url, re.IGNORECASE):
         url = "https://" + url
     return url
 
@@ -53,7 +53,7 @@ class Task:
         return domain_of(self.start_url)
 
     @classmethod
-    def from_record(cls, record: dict, index: int) -> "Task":
+    def from_record(cls, record: dict, index: int) -> Task:
         raw_urls = record.get("urls") or record.get("url") or record.get("website") or ""
         if isinstance(raw_urls, str):
             raw_urls = raw_urls.split()
@@ -105,10 +105,12 @@ class PageState:
     axtree: dict | None
     scroll: dict | None
     viewport: tuple[int, int]
+    http_status: int | None = None
     errors: list[str] = field(default_factory=list)
+    snapshot_meta: dict = field(default_factory=dict)
 
     @property
-    def text_signature(self) -> str:
+    def text_fingerprint(self) -> str:
         """Cheap page identity used for stale-state detection (screenshot hash is added separately)."""
         return f"{self.url}|{len(self.html or '')//512}"
 
@@ -118,7 +120,8 @@ class Verdict:
     """Block-detector output for one page state."""
 
     kind: str | None = None       # captcha | challenge | access_denied | rate_limit |
-                                  # login_wall | geo_blocked | empty_page | network_error
+                                  # login_wall | geo_blocked | not_found | server_error |
+                                  # network_error
     scope: str = "target"         # target | search
     evidence: str = ""
 
