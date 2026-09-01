@@ -1,0 +1,17 @@
+# Collected artifacts
+results/
+cache/
+
+# VM images (docker provider downloads here by default)
+docker_vm_data/
+*.qcow2
+*.vmdk
+*.vmx
+
+# Live credentials
+.env
+
+__pycache__/
+*.pyc
+*.egg-info/
+.DS_Store

@@ -1,0 +1,52 @@
+# Core
+numpy~=1.24.4
+Pillow~=11.0.0
+requests
+requests-toolbelt~=1.0.0
+tqdm~=4.65.0
+gymnasium~=0.28.1
+psutil~=5.9.6
+python-dotenv
+httpx
+backoff
+filelock
+
+# Agent (OpenAI-compatible endpoint)
+openai
+
+# Providers
+boto3        # aws
+docker       # docker
+
+# Task setup (setup controller)
+playwright
+lxml
+cssselect
+pytz~=2024.1
+
+# Task validators (evaluators)
+pandas~=2.2.3
+opencv-python-headless~=4.8.1.78
+scikit-image
+ImageHash
+openpyxl
+python-docx
+python-pptx
+pypdf
+pypdf2
+pymupdf
+pdfplumber
+borb
+odfpy
+formulas
+rapidfuzz
+mutagen
+librosa
+pyacoustid
+fastdtw
+easyocr
+beautifulsoup4
+xmltodict
+PyYaml
+tldextract
+pydrive
